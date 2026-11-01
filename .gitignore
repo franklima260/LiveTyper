@@ -1,3 +1,4 @@
 .claude/settings.local.json
 /target
 /tests/fixtures/tts-*
+/.claude/worktrees/

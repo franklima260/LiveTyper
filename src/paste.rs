@@ -11,6 +11,7 @@
 //! then stays on the clipboard, so that the user can push Ctrl+V.
 
 use std::cell::RefCell;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::thread;
 use std::time::{Duration, Instant};
 
@@ -67,14 +68,31 @@ pub fn start(text: String, done: impl FnOnce(PasteResult) + Send + 'static) {
     thread::Builder::new()
         .name("paste".into())
         .spawn(move || {
+            // Two pastes at the same time would save and restore each other's clipboard.
+            // A paste that hangs keeps the flag, so a later paste gives up after a short wait.
+            let started = Instant::now();
+            while BUSY.swap(true, Ordering::Acquire) {
+                if started.elapsed() >= BUSY_WAIT {
+                    log::error!("paste: an earlier paste still runs; this paste is skipped");
+                    done(PasteResult::NotPasted);
+                    return;
+                }
+                thread::sleep(Duration::from_millis(20));
+            }
             let result = paste(&text).unwrap_or_else(|e| {
                 log::error!("paste: {e}");
                 PasteResult::NotPasted
             });
+            BUSY.store(false, Ordering::Release);
             done(result);
         })
         .expect("spawn paste thread");
 }
+
+/// Set while a paste runs.
+static BUSY: AtomicBool = AtomicBool::new(false);
+/// The longest time a paste waits for an earlier paste to end.
+const BUSY_WAIT: Duration = Duration::from_secs(3);
 
 /// State that the window procedure shares with the paste loop (same thread).
 #[derive(Default)]
