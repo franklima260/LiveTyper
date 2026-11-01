@@ -4,16 +4,25 @@ version = "0.1.0"
 edition = "2024"
 
 [dependencies]
+cpal = "0.18.2"
+global-hotkey = "0.9.0"
 log = "0.4.35"
 serde = { version = "1.0.229", features = ["derive"] }
 toml = "1.1.8"
 # Default features include `metal` (macOS only), so they are off. CPU only for now (Vulkan is deferred).
 transcribe-cpp = { version = "0.4", default-features = false }
-windows = { version = "0.62.2", features = ["Win32_Foundation", "Win32_UI_WindowsAndMessaging", "Win32_UI_Shell", "Win32_System_LibraryLoader", "Win32_System_Threading", "Win32_System_Registry", "Win32_System_SystemInformation", "Win32_Graphics_Gdi", "Win32_Security"] }
+windows = { version = "0.62.2", features = ["Win32_Foundation", "Win32_UI_WindowsAndMessaging", "Win32_UI_Shell", "Win32_System_LibraryLoader", "Win32_System_Threading", "Win32_System_Registry", "Win32_System_SystemInformation", "Win32_Graphics_Gdi", "Win32_Security", "Win32_Graphics_Direct2D", "Win32_Graphics_Direct2D_Common", "Win32_Graphics_DirectWrite", "Win32_Graphics_Dxgi_Common", "Win32_UI_HiDpi", "Win32_UI_Accessibility", "Win32_UI_Input_KeyboardAndMouse", "Win32_System_DataExchange", "Win32_System_Memory", "Win32_System_Ole", "Win32_System_Com"] }
+windows-numerics = "0.3"
 
 [dev-dependencies]
 hound = "3"
 windows-sys = { version = "0.61", features = ["Win32_System_ProcessStatus", "Win32_System_Threading"] }
+
+[profile.release]
+lto = "thin"
+codegen-units = 1
+panic = "abort"
+strip = true
 
 [profile.dev.package."*"]
 # Speech decoding is far too slow without optimization, also in debug builds.
