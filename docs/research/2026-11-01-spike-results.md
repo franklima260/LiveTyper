@@ -76,3 +76,11 @@ Audio comes in real time. Nemotron decodes every 100 ms, and a Recast of the las
   ```
 
   Then repeat with `--live-threads 2 --recast-threads 6` if the laptop has 8 threads.
+
+## Decisions after the spike
+
+- **Lookahead:** the default is 480 ms (right context 6). The setting `lookahead_ms` accepts 0, 80, 480 and 1040 ms.
+- **Recast window:** the default is 15 s, not 30 s. The setting is `recast_window_s` (ADR 0002).
+- **Word times:** the stream has no word timestamps. The Draft does not align the words by their text. Each live word gets an approximate time (ADR 0006).
+- **Resampler:** the app uses its own windowed-sinc resampler (`src/resample.rs`) in place of `rubato`. It converts the microphone rate to 16 kHz.
+- **Clipboard:** `arboard` is not needed. The paste uses the Win32 clipboard functions directly through the `windows` crate, because it needs delayed rendering (ADR 0003).

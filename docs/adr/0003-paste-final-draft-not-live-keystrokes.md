@@ -1,3 +1,5 @@
 # Paste the final Draft; do not type live into the Target Text Box
 
 The name "LiveTyper" suggests live typing, but the live part is in the Scratch Pad only. When the user releases the Talk Key, the app pastes the final Draft into the Target Text Box through the clipboard, and then restores the user's clipboard. Live keystrokes into other apps cannot correct a word without backspaces, which break undo, autocomplete, and chat apps that send a message on Enter. A fallback that types the text as keystrokes, for apps that block paste, is deferred.
+
+The paste is a port of the reliable paste of Handy (MIT). The app puts the Draft on the clipboard with delayed rendering, and then sends Ctrl+V. The target app asks for the text, and this request is the receipt. The app keeps the text out of the Win+V clipboard history. After the paste, the app restores the user's clipboard only when nobody changed the clipboard during the paste. When no receipt comes in 1 s, the paste failed. Then the app leaves the Draft on the clipboard, and the Scratch Pad shows "Not pasted. Push Ctrl+V.".

@@ -10,6 +10,8 @@ mod engine;
 mod hotkey;
 mod icon;
 mod logging;
+#[cfg(test)]
+mod model_tests;
 mod paste;
 mod paths;
 mod resample;
