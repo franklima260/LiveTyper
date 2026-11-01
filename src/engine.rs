@@ -3,6 +3,7 @@
 //! The engine thread loads the models on the first Dictation, feeds the live model, and sends Recast
 //! jobs to a second thread. It reports Draft changes and the final text as `EngineEvent`s.
 
+use std::collections::VecDeque;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::sync::mpsc::{self, Receiver, RecvTimeoutError, Sender, TryRecvError};
@@ -22,8 +23,11 @@ pub const RECAST_MODEL: &str = "parakeet-tdt-0.6b-v3-Q8_0.gguf";
 
 /// The live model is fed in 100 ms chunks.
 const CHUNK: usize = SAMPLE_RATE / 10;
-/// A Recast needs at least this much audio.
+/// A Recast needs at least this much audio after the fixed boundary.
 const MIN_RECAST_SAMPLES: usize = SAMPLE_RATE / 4;
+/// Each Recast also decodes this much audio before the fixed boundary, so that the first words
+/// after the boundary have left context. The words in the context are not used.
+const RECAST_CONTEXT_MS: i64 = 2000;
 const IDLE_POLL: Duration = Duration::from_millis(15);
 
 #[derive(Debug, Clone)]
@@ -144,6 +148,9 @@ fn thread_counts(config: &EngineConfig) -> (i32, i32) {
 
 struct RecastJob {
     generation: u64,
+    /// The fixed boundary of the Draft when the job started.
+    boundary_ms: i64,
+    /// The start of `pcm`: the boundary minus the context.
     start_ms: i64,
     end_ms: i64,
     pcm: Vec<f32>,
@@ -151,9 +158,10 @@ struct RecastJob {
 
 struct RecastResult {
     generation: u64,
-    start_ms: i64,
+    boundary_ms: i64,
     end_ms: i64,
-    words: Vec<TimedWord>,
+    /// `None` if the decode failed. This is not the same as silence.
+    words: Option<Vec<TimedWord>>,
     took_ms: u128,
 }
 
@@ -212,24 +220,26 @@ fn recast_worker(mut session: Session, jobs: &Receiver<RecastJob>, results: &Sen
     while let Ok(job) = jobs.recv() {
         let started = Instant::now();
         let words = match session.run(&job.pcm, &options) {
-            Ok(transcript) => transcript
-                .words
-                .into_iter()
-                .map(|w| TimedWord {
-                    text: w.text.trim().to_owned(),
-                    t0_ms: job.start_ms + w.t0_ms,
-                    t1_ms: job.start_ms + w.t1_ms,
-                })
-                .filter(|w| !w.text.is_empty())
-                .collect(),
+            Ok(transcript) => Some(
+                transcript
+                    .words
+                    .into_iter()
+                    .map(|w| TimedWord {
+                        text: w.text.trim().to_owned(),
+                        t0_ms: job.start_ms + w.t0_ms,
+                        t1_ms: job.start_ms + w.t1_ms,
+                    })
+                    .filter(|w| !w.text.is_empty())
+                    .collect(),
+            ),
             Err(e) => {
                 log::error!("recast: {e}");
-                Vec::new()
+                None
             }
         };
         let result = RecastResult {
             generation: job.generation,
-            start_ms: job.start_ms,
+            boundary_ms: job.boundary_ms,
             end_ms: job.end_ms,
             words,
             took_ms: started.elapsed().as_millis(),
@@ -242,7 +252,16 @@ fn recast_worker(mut session: Session, jobs: &Receiver<RecastJob>, results: &Sen
 
 fn run(config: &EngineConfig, commands: &Receiver<Command>, emit: &dyn Fn(EngineEvent)) {
     let mut models: Option<Models> = None;
-    while let Ok(command) = commands.recv() {
+    // Commands that a Dictation received but did not use. They run before the next new command.
+    let mut pending: VecDeque<Command> = VecDeque::new();
+    loop {
+        let command = match pending.pop_front() {
+            Some(command) => command,
+            None => match commands.recv() {
+                Ok(command) => command,
+                Err(_) => return,
+            },
+        };
         match command {
             Command::Unload => {
                 if models.take().is_some() {
@@ -274,6 +293,7 @@ fn run(config: &EngineConfig, commands: &Receiver<Command>, emit: &dyn Fn(Engine
                     generation,
                     audio: &audio,
                     commands,
+                    pending: &mut pending,
                     emit,
                     draft: Draft::default(),
                     last_view: DraftView::default(),
@@ -290,9 +310,21 @@ fn run(config: &EngineConfig, commands: &Receiver<Command>, emit: &dyn Fn(Engine
     }
 }
 
-enum Outcome {
-    Finish,
-    Cancel,
+/// What the new commands tell the running Dictation to do.
+enum Poll {
+    Continue,
+    /// The Talk Key is up.
+    Stop,
+    /// End the Dictation now and send no more events for it.
+    End,
+}
+
+/// The end of the wait for a Recast.
+enum Wait {
+    /// The Recast is done. True if its words are now in the Draft.
+    Done(bool),
+    /// End the Dictation now and send no more events for it.
+    End,
 }
 
 struct Dictation<'a> {
@@ -300,6 +332,7 @@ struct Dictation<'a> {
     generation: u64,
     audio: &'a AudioBuffer,
     commands: &'a Receiver<Command>,
+    pending: &'a mut VecDeque<Command>,
     emit: &'a dyn Fn(EngineEvent),
     draft: Draft,
     last_view: DraftView,
@@ -335,18 +368,17 @@ impl Dictation<'_> {
         let mut stopping = false;
 
         loop {
-            match self.commands.try_recv() {
-                Ok(Command::Stop { generation }) if generation == self.generation => {
-                    stopping = true;
-                }
-                Ok(Command::Cancel { generation }) if generation == self.generation => return,
-                Err(TryRecvError::Disconnected) => return,
-                _ => {}
+            match self.poll() {
+                Poll::Continue => {}
+                Poll::Stop => stopping = true,
+                Poll::End => return,
             }
 
             let mut busy = false;
-            let available = self.audio.len();
+            // Read `closed` first: if the last push and the close come between the two reads,
+            // `available` then has all of the samples.
             let closed = self.audio.is_closed();
+            let available = self.audio.len();
             while available - fed >= CHUNK || (closed && fed < available) {
                 let end = (fed + CHUNK).min(available);
                 let chunk = self.audio.copy_range(fed, end);
@@ -409,7 +441,7 @@ impl Dictation<'_> {
             }
         }
         drop(stream);
-        if recast_running && let Outcome::Cancel = self.wait_for_recast(results) {
+        if recast_running && let Wait::End = self.wait_for_recast(results) {
             return;
         }
 
@@ -418,11 +450,13 @@ impl Dictation<'_> {
         let started = Instant::now();
         let text = if self.send_job(jobs, end) {
             match self.wait_for_recast(results) {
-                Outcome::Finish => {
+                Wait::Done(true) => {
                     self.stats.final_recast_ms = Some(started.elapsed().as_millis());
                     self.draft.final_text()
                 }
-                Outcome::Cancel => return,
+                // The last Recast failed: the live words are still needed.
+                Wait::Done(false) => self.draft.view().full(),
+                Wait::End => return,
             }
         } else {
             // Too little new audio for a Recast: the Draft is already final.
@@ -435,19 +469,52 @@ impl Dictation<'_> {
         });
     }
 
-    /// Sends a Recast of `[window start, end]`. Returns false if the window is too short.
+    /// Reads all new commands without a wait. A Start of another Dictation means that the app
+    /// gave up on this one: it ends now, and the Start runs next. An Unload runs after this
+    /// Dictation. Commands for older Dictations are ignored.
+    fn poll(&mut self) -> Poll {
+        let mut poll = Poll::Continue;
+        loop {
+            match self.commands.try_recv() {
+                Ok(Command::Stop { generation }) if generation == self.generation => {
+                    poll = Poll::Stop;
+                }
+                Ok(Command::Cancel { generation }) if generation == self.generation => {
+                    return Poll::End;
+                }
+                Ok(command @ Command::Start { generation, .. })
+                    if generation != self.generation =>
+                {
+                    log::warn!(
+                        "Dictation {generation} starts before Dictation {} is done; that one ends",
+                        self.generation
+                    );
+                    self.pending.push_back(command);
+                    return Poll::End;
+                }
+                Ok(Command::Unload) => self.pending.push_back(Command::Unload),
+                Ok(Command::Start { .. } | Command::Stop { .. } | Command::Cancel { .. }) => {}
+                Err(TryRecvError::Empty) => return poll,
+                Err(TryRecvError::Disconnected) => return Poll::End,
+            }
+        }
+    }
+
+    /// Sends a Recast of the audio from the fixed boundary to `end`, with context before the
+    /// boundary. Returns false if there is too little audio after the boundary.
     fn send_job(&mut self, jobs: &Sender<RecastJob>, end: usize) -> bool {
         let end_ms = ms(end);
-        let start_ms = self
+        let boundary_ms = self
             .draft
             .next_window_start(end_ms, self.config.recast_window_ms);
-        let start = (start_ms as usize * SAMPLE_RATE) / 1000;
-        if end.saturating_sub(start) < MIN_RECAST_SAMPLES {
+        if end.saturating_sub(samples(boundary_ms)) < MIN_RECAST_SAMPLES {
             return false;
         }
-        let pcm = self.audio.copy_range(start, end);
+        let start_ms = (boundary_ms - RECAST_CONTEXT_MS).max(0);
+        let pcm = self.audio.copy_range(samples(start_ms), end);
         jobs.send(RecastJob {
             generation: self.generation,
+            boundary_ms,
             start_ms,
             end_ms,
             pcm,
@@ -455,31 +522,35 @@ impl Dictation<'_> {
         .is_ok()
     }
 
-    /// Waits for the running Recast of this Dictation and applies it. A Cancel ends the wait.
-    fn wait_for_recast(&mut self, results: &Receiver<RecastResult>) -> Outcome {
+    /// Waits for the running Recast of this Dictation and applies it. New commands can end the wait.
+    fn wait_for_recast(&mut self, results: &Receiver<RecastResult>) -> Wait {
         loop {
             match results.recv_timeout(IDLE_POLL) {
                 Ok(result) if result.generation == self.generation => {
-                    self.apply(result);
-                    return Outcome::Finish;
+                    return Wait::Done(self.apply(result));
                 }
                 Ok(_) | Err(RecvTimeoutError::Timeout) => {}
-                Err(RecvTimeoutError::Disconnected) => return Outcome::Finish,
+                Err(RecvTimeoutError::Disconnected) => return Wait::Done(false),
             }
-            if let Ok(Command::Cancel { generation }) = self.commands.try_recv()
-                && generation == self.generation
-            {
-                return Outcome::Cancel;
+            if let Poll::End = self.poll() {
+                return Wait::End;
             }
         }
     }
 
-    fn apply(&mut self, result: RecastResult) {
+    /// Applies a Recast result. Returns true if its words are now in the Draft.
+    fn apply(&mut self, result: RecastResult) -> bool {
         self.stats.recasts += 1;
         self.stats.recast_total_ms += result.took_ms;
-        self.draft
-            .apply_recast(result.start_ms, result.end_ms, result.words);
+        let Some(words) = result.words else {
+            // A failed Recast changes nothing. The live words stay.
+            return false;
+        };
+        let applied = self
+            .draft
+            .apply_recast(result.boundary_ms, result.end_ms, words);
         self.publish();
+        applied
     }
 
     fn publish(&mut self) {
@@ -496,6 +567,10 @@ impl Dictation<'_> {
 
 fn ms(samples: usize) -> i64 {
     (samples * 1000 / SAMPLE_RATE) as i64
+}
+
+fn samples(ms: i64) -> usize {
+    ms.max(0) as usize * SAMPLE_RATE / 1000
 }
 
 #[cfg(test)]
