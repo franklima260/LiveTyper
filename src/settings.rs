@@ -70,6 +70,8 @@ const TEMPLATE: &str = r#"# LiveTyper settings. Restart LiveTyper after a change
 # A key that is not in this file takes its default value.
 
 # Hold this key combination to dictate. Examples: "Ctrl+Space", "Ctrl+Alt+D", "F9".
+# If another app uses the key (for example, PowerToys Peek can use Ctrl+Space), the Talk Key
+# does not work and LiveTyper shows a warning. Then set a different key here.
 talk_key = "Ctrl+Space"
 
 # Scratch Pad position: the center of its bottom edge, in screen pixels.

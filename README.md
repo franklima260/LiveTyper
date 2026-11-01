@@ -14,7 +14,7 @@ LiveTyper is 100% local. It makes no network connections while it runs: no cloud
 
 Other behavior:
 
-- **Cancel:** push Escape during a Dictation. LiveTyper pastes nothing.
+- **Cancel:** push Escape during a Dictation, also while you hold the Talk Key. LiveTyper pastes nothing.
 - **Short tap:** a Talk Key push shorter than 300 ms does nothing.
 - **"Not pasted. Push Ctrl+V.":** some windows do not accept the paste (for example, a window that runs as administrator). The Draft then stays on the clipboard. Push Ctrl+V to paste it.
 - **Paste Last Dictation:** this tray menu item pastes the last Draft again. LiveTyper keeps this text in memory only.
@@ -87,7 +87,7 @@ A key that is not in the file takes its default value. An unknown key or an inco
 
 | Key | Default | Meaning |
 |---|---|---|
-| `talk_key` | `"Ctrl+Space"` | The Talk Key. Examples: `"Ctrl+Space"`, `"Ctrl+Alt+D"`, `"F9"`. |
+| `talk_key` | `"Ctrl+Space"` | The Talk Key. Examples: `"Ctrl+Space"`, `"Ctrl+Alt+D"`, `"F9"`. If another app uses the key (for example, PowerToys Peek can use Ctrl+Space), the Talk Key does not work and LiveTyper shows a warning. Then set a different key. |
 | `scratch_pad_x` | not set | Scratch Pad position: the x value of the center of its bottom edge, in screen pixels. |
 | `scratch_pad_y` | not set | Scratch Pad position: the y value of the center of its bottom edge, in screen pixels. Without `scratch_pad_x` and `scratch_pad_y`, the Scratch Pad shows at the bottom center of the main screen. |
 | `scratch_pad_width` | `640` | Scratch Pad width, in pixels. |

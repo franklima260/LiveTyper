@@ -3,8 +3,11 @@
 //! It never takes the focus and lets mouse clicks pass through (`WS_EX_NOACTIVATE`,
 //! `WS_EX_TRANSPARENT`), so the caret stays in the Target Text Box. It is drawn with Direct2D and
 //! DirectWrite. It starts with one line of text and grows upward to at most 10 lines.
+//!
+//! The Direct2D and DirectWrite objects use much memory (Direct2D loads the graphics driver), so
+//! they are made on the first show, and the render target is released when the Scratch Pad hides.
 
-use windows::Win32::Foundation::{COLORREF, HWND, LPARAM, LRESULT, RECT, WPARAM};
+use windows::Win32::Foundation::{COLORREF, E_FAIL, HWND, LPARAM, LRESULT, RECT, WPARAM};
 use windows::Win32::Graphics::Direct2D::Common::{
     D2D_RECT_F, D2D_SIZE_U, D2D1_ALPHA_MODE_PREMULTIPLIED, D2D1_COLOR_F, D2D1_PIXEL_FORMAT,
 };
@@ -26,12 +29,12 @@ use windows::Win32::System::LibraryLoader::GetModuleHandleW;
 use windows::Win32::UI::HiDpi::GetDpiForWindow;
 use windows::Win32::UI::WindowsAndMessaging::{
     CreateWindowExW, DefWindowProcW, HTTRANSPARENT, HWND_TOPMOST, LWA_ALPHA, MA_NOACTIVATE,
-    RegisterClassW, SPI_GETWORKAREA, SW_HIDE, SWP_NOACTIVATE, SWP_SHOWWINDOW,
+    PostMessageW, RegisterClassW, SPI_GETWORKAREA, SW_HIDE, SWP_NOACTIVATE, SWP_SHOWWINDOW,
     SYSTEM_PARAMETERS_INFO_UPDATE_FLAGS, SetLayeredWindowAttributes, SetWindowPos, ShowWindow,
-    SystemParametersInfoW, WM_MOUSEACTIVATE, WM_NCHITTEST, WM_PAINT, WNDCLASSW, WS_EX_LAYERED,
-    WS_EX_NOACTIVATE, WS_EX_TOOLWINDOW, WS_EX_TOPMOST, WS_EX_TRANSPARENT, WS_POPUP,
+    SystemParametersInfoW, WM_APP, WM_MOUSEACTIVATE, WM_NCHITTEST, WM_PAINT, WNDCLASSW,
+    WS_EX_LAYERED, WS_EX_NOACTIVATE, WS_EX_TOOLWINDOW, WS_EX_TOPMOST, WS_EX_TRANSPARENT, WS_POPUP,
 };
-use windows::core::{Interface, Result, w};
+use windows::core::{Error, Interface, Result, w};
 
 use crate::draft::DraftView;
 
@@ -46,6 +49,11 @@ const LEVEL_WIDTH: f32 = 90.0;
 const CORNER: f32 = 10.0;
 /// Distance from the bottom of the work area when no position is set.
 const DEFAULT_BOTTOM_MARGIN: f32 = 24.0;
+/// Asks for a new WM_PAINT. A WM_PAINT cannot do this itself, because its update region is
+/// validated when it ends.
+const WM_REPAINT: u32 = WM_APP + 1;
+/// After this number of failed draws in sequence, the Scratch Pad stops to try again until the next change.
+const MAX_REDRAW_TRIES: u32 = 3;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Status {
@@ -66,13 +74,57 @@ struct Resources {
     track: ID2D1SolidColorBrush,
 }
 
-pub struct ScratchPad {
-    hwnd: HWND,
+/// The factories and text formats. Made on the first show, then kept.
+struct Graphics {
     d2d: ID2D1Factory,
     dwrite: IDWriteFactory,
     text_format: IDWriteTextFormat,
     status_format: IDWriteTextFormat,
+}
+
+impl Graphics {
+    fn new() -> Result<Graphics> {
+        unsafe {
+            let d2d: ID2D1Factory = D2D1CreateFactory(D2D1_FACTORY_TYPE_SINGLE_THREADED, None)?;
+            let dwrite: IDWriteFactory = DWriteCreateFactory(DWRITE_FACTORY_TYPE_SHARED)?;
+            let text_format = dwrite.CreateTextFormat(
+                w!("Segoe UI"),
+                None,
+                DWRITE_FONT_WEIGHT_NORMAL,
+                DWRITE_FONT_STYLE_NORMAL,
+                DWRITE_FONT_STRETCH_NORMAL,
+                TEXT_SIZE,
+                w!("en-us"),
+            )?;
+            text_format.SetWordWrapping(DWRITE_WORD_WRAPPING_WRAP)?;
+            let status_format = dwrite.CreateTextFormat(
+                w!("Segoe UI"),
+                None,
+                DWRITE_FONT_WEIGHT_SEMI_BOLD,
+                DWRITE_FONT_STYLE_NORMAL,
+                DWRITE_FONT_STRETCH_NORMAL,
+                STATUS_SIZE,
+                w!("en-us"),
+            )?;
+            status_format.SetWordWrapping(DWRITE_WORD_WRAPPING_NO_WRAP)?;
+            Ok(Graphics {
+                d2d,
+                dwrite,
+                text_format,
+                status_format,
+            })
+        }
+    }
+}
+
+pub struct ScratchPad {
+    hwnd: HWND,
+    /// `None` until the first show.
+    graphics: Option<Graphics>,
+    /// The render target and brushes. `None` while the Scratch Pad is hidden.
     resources: Option<Resources>,
+    /// Failed draws in sequence.
+    failed_draws: u32,
     anchor: Option<(i32, i32)>,
     width_dip: f32,
     status: Status,
@@ -116,36 +168,11 @@ impl ScratchPad {
             )?;
             SetLayeredWindowAttributes(hwnd, COLORREF(0), 245, LWA_ALPHA)?;
 
-            let d2d: ID2D1Factory = D2D1CreateFactory(D2D1_FACTORY_TYPE_SINGLE_THREADED, None)?;
-            let dwrite: IDWriteFactory = DWriteCreateFactory(DWRITE_FACTORY_TYPE_SHARED)?;
-            let text_format = dwrite.CreateTextFormat(
-                w!("Segoe UI"),
-                None,
-                DWRITE_FONT_WEIGHT_NORMAL,
-                DWRITE_FONT_STYLE_NORMAL,
-                DWRITE_FONT_STRETCH_NORMAL,
-                TEXT_SIZE,
-                w!("en-us"),
-            )?;
-            text_format.SetWordWrapping(DWRITE_WORD_WRAPPING_WRAP)?;
-            let status_format = dwrite.CreateTextFormat(
-                w!("Segoe UI"),
-                None,
-                DWRITE_FONT_WEIGHT_SEMI_BOLD,
-                DWRITE_FONT_STYLE_NORMAL,
-                DWRITE_FONT_STRETCH_NORMAL,
-                STATUS_SIZE,
-                w!("en-us"),
-            )?;
-            status_format.SetWordWrapping(DWRITE_WORD_WRAPPING_NO_WRAP)?;
-
             Ok(ScratchPad {
                 hwnd,
-                d2d,
-                dwrite,
-                text_format,
-                status_format,
+                graphics: None,
                 resources: None,
+                failed_draws: 0,
                 anchor,
                 width_dip: width_dip.max(240) as f32,
                 status: Status::Listening,
@@ -159,15 +186,27 @@ impl ScratchPad {
 
     /// Shows the Scratch Pad with an empty Draft, without taking the focus.
     pub fn show(&mut self, status: Status) {
+        if self.graphics.is_none() {
+            match Graphics::new() {
+                Ok(g) => self.graphics = Some(g),
+                Err(e) => {
+                    log::error!("scratch pad graphics: {e}");
+                    return;
+                }
+            }
+        }
         self.status = status;
         self.view = DraftView::default();
         self.level = 0.0;
         self.visible = true;
+        self.failed_draws = 0;
         self.layout();
     }
 
+    /// Hides the Scratch Pad and releases the render target, which holds graphics memory.
     pub fn hide(&mut self) {
         self.visible = false;
+        self.resources = None;
         unsafe {
             let _ = ShowWindow(self.hwnd, SW_HIDE);
         }
@@ -194,9 +233,18 @@ impl ScratchPad {
         }
     }
 
-    fn scale(&self) -> f32 {
+    /// The current DPI of the window (it changes when the window moves to a different screen).
+    fn dpi(&self) -> f32 {
         let dpi = unsafe { GetDpiForWindow(self.hwnd) };
-        if dpi == 0 { 1.0 } else { dpi as f32 / 96.0 }
+        if dpi == 0 { 96.0 } else { dpi as f32 }
+    }
+
+    fn scale(&self) -> f32 {
+        self.dpi() / 96.0
+    }
+
+    fn graphics(&self) -> Result<&Graphics> {
+        self.graphics.as_ref().ok_or_else(|| Error::from(E_FAIL))
     }
 
     fn text_width(&self) -> f32 {
@@ -206,9 +254,10 @@ impl ScratchPad {
     fn text_layout(&self) -> Result<IDWriteTextLayout> {
         let text = self.view.full();
         let wide: Vec<u16> = text.encode_utf16().collect();
+        let g = self.graphics()?;
         unsafe {
-            self.dwrite
-                .CreateTextLayout(&wide, &self.text_format, self.text_width(), f32::MAX)
+            g.dwrite
+                .CreateTextLayout(&wide, &g.text_format, self.text_width(), f32::MAX)
         }
     }
 
@@ -273,9 +322,10 @@ impl ScratchPad {
     }
 
     fn create_resources(&self) -> Result<Resources> {
+        let dpi = self.dpi();
+        let g = self.graphics()?;
         unsafe {
-            let dpi = GetDpiForWindow(self.hwnd).max(96) as f32;
-            let target = self.d2d.CreateHwndRenderTarget(
+            let target = g.d2d.CreateHwndRenderTarget(
                 &D2D1_RENDER_TARGET_PROPERTIES {
                     pixelFormat: D2D1_PIXEL_FORMAT {
                         format: DXGI_FORMAT_B8G8R8A8_UNORM,
@@ -311,6 +361,9 @@ impl ScratchPad {
 
     /// Draws the Scratch Pad. Called on WM_PAINT.
     pub fn paint(&mut self) {
+        if !self.visible {
+            return;
+        }
         if self.resources.is_none() {
             match self.create_resources() {
                 Ok(r) => self.resources = Some(r),
@@ -320,20 +373,32 @@ impl ScratchPad {
                 }
             }
         }
-        if let Err(e) = self.draw() {
-            // D2DERR_RECREATE_TARGET and similar: make new resources on the next paint.
-            log::info!("scratch pad redraw: {e}");
-            self.resources = None;
-            self.invalidate();
+        match self.draw() {
+            Ok(()) => self.failed_draws = 0,
+            Err(e) => {
+                // D2DERR_RECREATE_TARGET and similar: make new resources and draw again.
+                log::info!("scratch pad redraw: {e}");
+                self.resources = None;
+                if self.failed_draws < MAX_REDRAW_TRIES {
+                    self.failed_draws += 1;
+                    unsafe {
+                        let _ = PostMessageW(Some(self.hwnd), WM_REPAINT, WPARAM(0), LPARAM(0));
+                    }
+                }
+            }
         }
     }
 
     fn draw(&self) -> Result<()> {
         let r = self.resources.as_ref().expect("resources exist");
-        let scale = self.scale();
+        let g = self.graphics()?;
+        let dpi = self.dpi();
+        let scale = dpi / 96.0;
         let width = self.size.0 as f32 / scale;
         let height = self.size.1 as f32 / scale;
         unsafe {
+            // The target keeps the DPI from its creation; the window can be on a different screen now.
+            r.target.SetDpi(dpi, dpi);
             r.target.BeginDraw();
             r.target.Clear(Some(&color(0.12, 0.12, 0.14)));
             r.target.FillRoundedRectangle(
@@ -368,7 +433,7 @@ impl ScratchPad {
             let label_width = width - 2.0 * PADDING - 16.0 - LEVEL_WIDTH - 12.0;
             r.target.DrawText(
                 &wide,
-                &self.status_format,
+                &g.status_format,
                 &rect(
                     PADDING + 16.0,
                     PADDING,
@@ -473,6 +538,12 @@ unsafe extern "system" fn window_proc(
             unsafe {
                 let _ = EndPaint(hwnd, &ps);
                 let _ = ValidateRect(Some(hwnd), None);
+            }
+            LRESULT(0)
+        }
+        WM_REPAINT => {
+            unsafe {
+                let _ = windows::Win32::Graphics::Gdi::InvalidateRect(Some(hwnd), None, false);
             }
             LRESULT(0)
         }

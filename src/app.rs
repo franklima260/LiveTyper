@@ -41,7 +41,8 @@ pub enum UiEvent {
     Engine(EngineEvent),
     MicrophoneError(String),
     Pasted {
-        dictation: bool,
+        /// The generation of the Dictation, or `None` for Paste Last Dictation.
+        dictation: Option<u64>,
         result: PasteResult,
     },
 }
@@ -52,9 +53,12 @@ const TIMER_LEVEL: usize = 1;
 const TIMER_DEADLINE: usize = 2;
 const TIMER_IDLE: usize = 3;
 const TIMER_HIDE_MESSAGE: usize = 4;
+const TIMER_PASTE: usize = 5;
 
 const LEVEL_INTERVAL_MS: u32 = 33;
 const IDLE_CHECK_MS: u32 = 60_000;
+/// A paste that takes longer (for example, a hung clipboard owner) no longer blocks the Talk Key.
+const PASTE_GUARD_MS: u32 = 5_000;
 const NOT_PASTED_MESSAGE: &str = "Not pasted. Push Ctrl+V.";
 
 static EVENTS: OnceLock<Sender<UiEvent>> = OnceLock::new();
@@ -115,7 +119,10 @@ struct App {
     /// For Paste Last Dictation. In memory only.
     last_text: Option<String>,
     last_activity: Instant,
+    /// True until the engine reports that the models are ready, and again after an unload.
     models_unloaded: bool,
+    /// The Talk Key is up but the models still load: the release deadline starts when they are ready.
+    deadline_waits_for_models: bool,
 }
 
 /// Creates the windows and the worker threads, then runs the message loop until Quit.
@@ -220,6 +227,7 @@ pub fn run(settings: Settings, startup_warning: Option<String>) -> Result<()> {
             last_text: None,
             last_activity: Instant::now(),
             models_unloaded: true,
+            deadline_waits_for_models: false,
         })
     });
 
@@ -363,6 +371,10 @@ impl App {
                 if self.is_current(generation) && self.dictation.state() == State::Recording {
                     self.pad.set_status(Status::Listening);
                 }
+                // Also for an older generation: the models are ready for the current Dictation too.
+                if self.deadline_waits_for_models && self.dictation.state() == State::Finishing {
+                    self.start_deadline();
+                }
             }
             UiEvent::Engine(EngineEvent::Draft { generation, view }) => {
                 if self.is_current(generation) {
@@ -397,11 +409,16 @@ impl App {
                 }
             }
             UiEvent::Pasted { dictation, result } => {
-                if dictation {
-                    self.step(Event::PasteDone);
-                    self.log_dictation(result);
+                if let Some(generation) = dictation {
+                    if generation == self.generation && self.dictation.state() == State::Pasting {
+                        self.kill_timer(TIMER_PASTE);
+                        self.step(Event::PasteDone);
+                        self.log_dictation(result);
+                    } else {
+                        log::info!("late paste result {result:?}: the paste guard ended it before");
+                    }
                 }
-                if result == PasteResult::NotPasted {
+                if result == PasteResult::NotPasted && self.dictation.state() == State::Idle {
                     self.show_message(NOT_PASTED_MESSAGE.into(), Duration::from_secs(3));
                 }
             }
@@ -447,14 +464,13 @@ impl App {
                 self.engine.stop(self.generation);
                 self.released_at = Instant::now();
                 self.pad.set_status(Status::Finishing);
-                unsafe {
-                    SetTimer(
-                        Some(self.hwnd),
-                        TIMER_DEADLINE,
-                        self.settings.release_deadline_ms,
-                        None,
-                    )
-                };
+                if self.models_unloaded {
+                    // The deadline must not paste an empty Draft while the models load.
+                    log::info!("release deadline waits for the models");
+                    self.deadline_waits_for_models = true;
+                } else {
+                    self.start_deadline();
+                }
                 self.set_icon(IconState::Busy);
             }
             Action::Paste => {
@@ -467,20 +483,36 @@ impl App {
                     return;
                 }
                 self.last_text = Some(text.clone());
-                paste::start(text, |result| {
+                let generation = self.generation;
+                paste::start(text, move |result| {
                     post(UiEvent::Pasted {
-                        dictation: true,
+                        dictation: Some(generation),
                         result,
                     })
                 });
+                unsafe { SetTimer(Some(self.hwnd), TIMER_PASTE, PASTE_GUARD_MS, None) };
             }
         }
+    }
+
+    /// Starts the release deadline: after it, the current Draft pastes without the last Recast.
+    fn start_deadline(&mut self) {
+        self.deadline_waits_for_models = false;
+        unsafe {
+            SetTimer(
+                Some(self.hwnd),
+                TIMER_DEADLINE,
+                self.settings.release_deadline_ms,
+                None,
+            )
+        };
     }
 
     fn end_dictation(&mut self) {
         self.set_escape(false);
         self.kill_timer(TIMER_LEVEL);
         self.kill_timer(TIMER_DEADLINE);
+        self.deadline_waits_for_models = false;
         self.audio = None;
         self.set_icon(IconState::Idle);
         self.last_activity = Instant::now();
@@ -502,6 +534,15 @@ impl App {
                     );
                     self.final_text = None;
                     self.step(Event::DraftFinal);
+                }
+            }
+            TIMER_PASTE => {
+                self.kill_timer(TIMER_PASTE);
+                if self.dictation.state() == State::Pasting {
+                    log::error!(
+                        "paste did not end in {PASTE_GUARD_MS} ms: the Dictation ends without a paste result"
+                    );
+                    self.step(Event::PasteDone);
                 }
             }
             TIMER_IDLE => {
@@ -538,6 +579,11 @@ impl App {
     }
 
     fn paste_last(&mut self) {
+        // The Talk Key can start a Dictation while the menu shows.
+        if self.dictation.state() != State::Idle {
+            log::info!("Paste Last Dictation not done: a Dictation runs");
+            return;
+        }
         let Some(text) = self.last_text.clone() else {
             return;
         };
@@ -546,7 +592,7 @@ impl App {
             thread::sleep(Duration::from_millis(150));
             paste::start(text, |result| {
                 post(UiEvent::Pasted {
-                    dictation: false,
+                    dictation: None,
                     result,
                 })
             });
