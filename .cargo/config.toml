@@ -1,0 +1,5 @@
+[env]
+# A portable CPU floor for the Minimum Device (x86-64 with AVX2), not tuned to the build PC.
+TRANSCRIBE_CMAKE_ARGS = "-DGGML_NATIVE=OFF -DGGML_AVX=ON -DGGML_AVX2=ON -DGGML_FMA=ON -DGGML_F16C=ON -DGGML_BMI2=ON"
+# CMake that ships with Visual Studio Build Tools 2019 (not on PATH by default).
+CMAKE = "C:/Program Files (x86)/Microsoft Visual Studio/2019/BuildTools/Common7/IDE/CommonExtensions/Microsoft/CMake/CMake/bin/cmake.exe"

@@ -1,0 +1,16 @@
+[package]
+name = "livetyper"
+version = "0.1.0"
+edition = "2024"
+
+[dependencies]
+# Default features include `metal` (macOS only), so they are off. CPU only for now (Vulkan is deferred).
+transcribe-cpp = { version = "0.4", default-features = false }
+
+[dev-dependencies]
+hound = "3"
+windows-sys = { version = "0.61", features = ["Win32_System_ProcessStatus", "Win32_System_Threading"] }
+
+[profile.dev.package."*"]
+# Speech decoding is far too slow without optimization, also in debug builds.
+opt-level = 3
