@@ -24,7 +24,7 @@ use windows::Win32::UI::WindowsAndMessaging::{
 };
 use windows::core::{Result, w};
 
-use crate::audio::{AudioBuffer, Capture, SAMPLE_RATE};
+use crate::audio::{AudioBuffer, Capture, KeepOpen, SAMPLE_RATE};
 use crate::dictation::{Action, Dictation, Event, Next, State};
 use crate::draft::DraftView;
 use crate::engine::{Engine, EngineConfig, EngineEvent, Stats};
@@ -33,7 +33,7 @@ use crate::icon::{IconState, Icons};
 use crate::paste::{self, PasteResult};
 use crate::paths;
 use crate::scratch_pad::{ScratchPad, Status};
-use crate::settings::Settings;
+use crate::settings::{MicrophoneOpen, Settings};
 use crate::tray::{self, MenuCommand, WM_TRAY};
 
 pub enum UiEvent {
@@ -183,7 +183,14 @@ pub fn run(settings: Settings, startup_warning: Option<String>) -> Result<()> {
         tray::show_warning(hwnd, text);
     }
 
-    let capture = Capture::new(settings.microphone.clone(), |message| {
+    let keep_open = match settings.microphone_open {
+        MicrophoneOpen::Always => KeepOpen::Always,
+        MicrophoneOpen::AfterUse => KeepOpen::After(Duration::from_secs(
+            u64::from(settings.microphone_open_after_use_min) * 60,
+        )),
+        MicrophoneOpen::Dictation => KeepOpen::Never,
+    };
+    let capture = Capture::new(settings.microphone.clone(), keep_open, |message| {
         post(UiEvent::MicrophoneError(message));
     });
     let engine = Engine::new(

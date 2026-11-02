@@ -18,6 +18,8 @@ pub struct Settings {
     pub scratch_pad_y: Option<i32>,
     pub scratch_pad_width: u32,
     pub microphone: String,
+    pub microphone_open: MicrophoneOpen,
+    pub microphone_open_after_use_min: u32,
     pub models_dir: String,
     pub unload_after_min: u32,
     pub lookahead_ms: u32,
@@ -38,6 +40,8 @@ impl Default for Settings {
             scratch_pad_y: None,
             scratch_pad_width: 640,
             microphone: String::new(),
+            microphone_open: MicrophoneOpen::Always,
+            microphone_open_after_use_min: 5,
             models_dir: String::new(),
             unload_after_min: 10,
             lookahead_ms: 480,
@@ -50,6 +54,19 @@ impl Default for Settings {
             start_with_windows: true,
         }
     }
+}
+
+/// When the microphone is open. While it is open, LiveTyper keeps the last seconds of audio in
+/// memory, so that a Dictation can start a moment before the push of the Talk Key.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum MicrophoneOpen {
+    /// All the time while LiveTyper runs.
+    Always,
+    /// From the first Dictation until `microphone_open_after_use_min` after the last one.
+    AfterUse,
+    /// Only during a Dictation: no audio from before the push.
+    Dictation,
 }
 
 impl Settings {
@@ -81,6 +98,16 @@ scratch_pad_width = 640
 
 # Microphone name, as Windows shows it. Empty = the Windows default microphone.
 microphone = ""
+
+# When the microphone is open. While it is open, LiveTyper keeps the last 3 seconds of audio in
+# memory only (never on disk), so that a Dictation also gets the start of a word that you began a
+# moment before you pushed the Talk Key.
+#   "always"    = all the time while LiveTyper runs. Windows shows the microphone icon all the time.
+#   "after_use" = from a Dictation until microphone_open_after_use_min minutes after the last one.
+#                 Use this with a Bluetooth headset: while its microphone is open, its sound is worse.
+#   "dictation" = only while you hold the Talk Key. The start of a word before the push is lost.
+microphone_open = "always"
+microphone_open_after_use_min = 5
 
 # Folder with the model files. Empty = %LOCALAPPDATA%\LiveTyper\models.
 models_dir = ""
@@ -122,6 +149,9 @@ pub fn parse(text: &str) -> Result<Settings, String> {
         return Err(format!(
             "lookahead_ms: must be one of {LOOKAHEAD_CHOICES_MS:?}"
         ));
+    }
+    if settings.microphone_open_after_use_min < 1 {
+        return Err("microphone_open_after_use_min: must be 1 or more".into());
     }
     if settings.recast_window_s < 2 {
         return Err("recast_window_s: must be 2 or more".into());
@@ -204,6 +234,26 @@ mod tests {
     fn lookahead_must_be_a_trained_value() {
         assert!(parse("lookahead_ms = 300").is_err());
         assert!(parse("lookahead_ms = 80").is_ok());
+    }
+
+    #[test]
+    fn microphone_open_values() {
+        let s = parse("microphone_open = \"after_use\"").unwrap();
+        assert_eq!(s.microphone_open, MicrophoneOpen::AfterUse);
+        assert_eq!(
+            parse("microphone_open = \"dictation\"")
+                .unwrap()
+                .microphone_open,
+            MicrophoneOpen::Dictation
+        );
+        assert!(parse("microphone_open = \"sometimes\"").is_err());
+        assert!(parse("microphone_open_after_use_min = 0").is_err());
+        assert_eq!(
+            parse("microphone_open_after_use_min = 15")
+                .unwrap()
+                .microphone_open_after_use_min,
+            15
+        );
     }
 
     #[test]
