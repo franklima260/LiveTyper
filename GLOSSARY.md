@@ -28,6 +28,10 @@ _Avoid_: Final pass, re-decode, second pass
 A word in the Draft that came from the live decode and that no Recast has checked yet. The Scratch Pad shows Unchecked Words differently from the other words of the Draft.
 _Avoid_: Tentative word, partial, grey text
 
+**Follow-up Dictation**:
+A Dictation that the user starts while the last Dictation still finishes, or soon after it, into the same Target Text Box. Its text continues the text of the last Dictation.
+_Avoid_: Restrike, second Dictation
+
 **Target Text Box**:
 The text box that has the focus when the user releases the Talk Key, and that receives the final Draft.
 _Avoid_: Target field, input, focused window

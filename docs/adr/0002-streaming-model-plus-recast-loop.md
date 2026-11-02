@@ -8,6 +8,6 @@ The user wants each word to show immediately, and also wants earlier words corre
 
 ## Consequences
 
-- Each Recast decodes only the last 30 s of audio, so that it stays short. Words older than 30 s are fixed. A voice detector that fixes words at each pause was considered and deferred, to keep the first version simple.
+- Each Recast decodes only the last part of the audio, so that it stays short. Words older than that window are fixed. The window is a setting with a default of 15 s: the M0 spike showed that a 30 s Recast takes 2.8–4.1 s with 4 threads, which is too slow (docs/research/2026-11-01-spike-results.md). A voice detector that fixes words at each pause was considered and deferred, to keep the first version simple.
 - When the user releases the Talk Key, the app waits a maximum of 2 s for the last Recast. If it takes longer, the app pastes the current Draft.
 - Two models stay in memory during use (approximately 1.5 to 2 GB, an estimate). The app removes them after 10 minutes without a Dictation, and keeps the audio while they load again.
