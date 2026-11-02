@@ -17,7 +17,7 @@ use global_hotkey::hotkey::{HotKey, Modifiers};
 use windows::Win32::Foundation::{LPARAM, LRESULT, WPARAM};
 use windows::Win32::System::LibraryLoader::GetModuleHandleW;
 use windows::Win32::UI::WindowsAndMessaging::{
-    CallNextHookEx, DispatchMessageW, GetMessageW, HC_ACTION, KBDLLHOOKSTRUCT, LLKHF_INJECTED, MSG,
+    CallNextHookEx, DispatchMessageW, GetMessageW, HC_ACTION, KBDLLHOOKSTRUCT, MSG,
     SetWindowsHookExW, TranslateMessage, WH_KEYBOARD_LL, WM_KEYDOWN, WM_KEYUP, WM_SYSKEYDOWN,
     WM_SYSKEYUP,
 };
@@ -93,9 +93,10 @@ unsafe extern "system" fn hook_proc(code: i32, wparam: WPARAM, lparam: LPARAM) -
         let info = unsafe { &*(lparam.0 as *const KBDLLHOOKSTRUCT) };
         let down = matches!(wparam.0 as u32, WM_KEYDOWN | WM_SYSKEYDOWN);
         let up = matches!(wparam.0 as u32, WM_KEYUP | WM_SYSKEYUP);
-        // Keys that apps send (for example the paste keys) do not change what the user holds.
-        let injected = info.flags.0 & LLKHF_INJECTED.0 != 0;
-        if (down || up) && !injected {
+        // LiveTyper's own paste keys do not change what the user holds. Keys that other apps send
+        // (for example a test script or a remote desktop) count as the user's keys.
+        let own = info.dwExtraInfo == crate::paste::OWN_INPUT;
+        if (down || up) && !own {
             let escape_on = ESCAPE_ON.load(Ordering::Relaxed);
             let result = KEYBOARD.with_borrow_mut(|k| {
                 k.as_mut()

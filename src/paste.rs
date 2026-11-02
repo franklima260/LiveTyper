@@ -421,6 +421,10 @@ fn as_bytes(text: &[u16]) -> &[u8] {
     unsafe { std::slice::from_raw_parts(text.as_ptr() as *const u8, text.len() * 2) }
 }
 
+/// The mark on the key events that LiveTyper sends (`dwExtraInfo`). The Talk Key hook ignores
+/// these events, so that the paste keys do not change what the user holds.
+pub const OWN_INPUT: usize = 0x4C54_5950;
+
 fn key(vk: VIRTUAL_KEY, up: bool) -> INPUT {
     INPUT {
         r#type: INPUT_KEYBOARD,
@@ -432,6 +436,7 @@ fn key(vk: VIRTUAL_KEY, up: bool) -> INPUT {
                 } else {
                     KEYBD_EVENT_FLAGS(0)
                 },
+                dwExtraInfo: OWN_INPUT,
                 ..Default::default()
             },
         },

@@ -4,7 +4,7 @@
 
 .DESCRIPTION
   The script starts target\release\livetyper.exe with LIVETYPER_TEST_AUDIO set to a WAV fixture,
-  opens a new classic Notepad, holds the Talk Key (Ctrl+Space) with keybd_event, and reads the
+  opens a new classic Notepad, holds the Talk Key with keybd_event, and reads the
   pasted text back from the Notepad "Edit" control.
 
   The script injects keys only while its own Notepad window is the foreground window. If the
@@ -31,7 +31,7 @@ param(
     [string]$OutDir = "$env:TEMP\livetyper-e2e",
     [string[]]$Cases = @("idle", "dictation", "warm", "tap", "escape", "image", "quit"),
     [int]$Screenshots = 3,
-    # Use another Talk Key when another app holds Ctrl+Space (PowerToys Peek uses it by default).
+    # The Talk Key that the script holds. The script writes it into the settings file.
     # The script then writes it to settings.toml and restores the file byte for byte at the end.
     [ValidateSet("Ctrl+Space", "Ctrl+Shift+Space")][string]$TalkKey = "Ctrl+Space",
     [switch]$NoRun
@@ -203,7 +203,7 @@ function Save-Screenshot([string]$path) {
 }
 
 <#
-  Holds Ctrl+Space for $HoldMs in the test Notepad. $Actions is a hashtable of
+  Holds the Talk Key for $HoldMs in the test Notepad. $Actions is a hashtable of
   millisecond offset -> scriptblock (for example screenshots or Escape). Returns timings and
   foreground checks.
 #>
@@ -308,8 +308,8 @@ function Test-ShortTap {
 function Test-Escape {
     Set-Clipboard "SENTINEL-123"
     $np = Start-TestNotepad; $from = Get-LogLineCount
-    # Ctrl+Escape would open the Start menu (Escape is registered without modifiers), so Ctrl
-    # goes up first while Space stays down: the Talk Key release check polls Space only.
+    # The modifiers go up first while Space stays down: the Talk Key ends only when its main key
+    # goes up. Then Escape cancels the Dictation.
     $hold = Invoke-TalkKey $np 4000 @{
         2500 = { foreach ($m in $script:Mods) { Key $m $true } }
         3000 = { Key $VK_ESCAPE $false; Start-Sleep -Milliseconds 60; Key $VK_ESCAPE $true }
