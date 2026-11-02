@@ -57,7 +57,7 @@ pub enum PasteResult {
 const QUIET_PERIOD: Duration = Duration::from_millis(200);
 const RECEIPT_TIMEOUT: Duration = Duration::from_secs(1);
 const MAX_FORMAT_BYTES: usize = 64 * 1024 * 1024;
-/// The longest time to wait for the user to release Alt, Win or Shift before the paste keys.
+/// The longest time to wait for the user to release Alt or Win before the paste keys.
 const MODIFIER_WAIT: Duration = Duration::from_millis(300);
 
 /// Pastes on a new thread and calls `done` with the result.
@@ -458,14 +458,19 @@ fn held_keys() -> HeldKeys {
     }
 }
 
-/// True when a held key changes the meaning of the paste keys. Shift is part of the terminal
-/// paste keys, thus it is not a problem for a terminal.
-fn must_wait(held: HeldKeys, terminal: bool) -> bool {
-    held.alt || held.win || (held.shift && !terminal)
+/// True when a held key changes the meaning of the paste keys. A held Shift is not a reason to
+/// wait: the paste lifts it (see `paste_keys`).
+fn must_wait(held: HeldKeys, _terminal: bool) -> bool {
+    held.alt || held.win
 }
 
-/// The key events of the paste, as (key, up). The paste does not push or release a modifier that
-/// the user holds, so that Windows does not think that it is up while the user holds it.
+/// The key events of the paste, as (key, up). The paste does not push or release Ctrl when the
+/// user holds it, so that Windows does not think that it is up while the user holds it.
+///
+/// A held Shift (the user holds the Talk Key for the next Dictation) would change Ctrl+V into
+/// Ctrl+Shift+V, which some apps read as a different paste. Thus outside a terminal the paste
+/// lifts Shift for the paste keys and pushes it down again after them. (Alt or Win cannot be
+/// lifted: a lone Alt or Win release opens a menu.)
 fn paste_keys(terminal: bool, held: HeldKeys) -> Vec<(VIRTUAL_KEY, bool)> {
     let mut modifiers = Vec::new();
     if !held.ctrl {
@@ -474,9 +479,17 @@ fn paste_keys(terminal: bool, held: HeldKeys) -> Vec<(VIRTUAL_KEY, bool)> {
     if terminal && !held.shift {
         modifiers.push(VK_SHIFT);
     }
-    let mut keys: Vec<_> = modifiers.iter().map(|&vk| (vk, false)).collect();
+    let lift_shift = held.shift && !terminal;
+    let mut keys = Vec::new();
+    if lift_shift {
+        keys.push((VK_SHIFT, true));
+    }
+    keys.extend(modifiers.iter().map(|&vk| (vk, false)));
     keys.extend([(VK_V, false), (VK_V, true)]);
     keys.extend(modifiers.iter().rev().map(|&vk| (vk, true)));
+    if lift_shift {
+        keys.push((VK_SHIFT, false));
+    }
     keys
 }
 
@@ -562,13 +575,32 @@ mod tests {
     }
 
     #[test]
-    fn wait_for_shift_except_in_a_terminal() {
+    fn shift_does_not_cause_a_wait() {
         let held = HeldKeys {
             shift: true,
             ..NONE
         };
-        assert!(must_wait(held, false));
+        assert!(!must_wait(held, false));
         assert!(!must_wait(held, true));
+    }
+
+    #[test]
+    fn held_shift_is_lifted_for_ctrl_v() {
+        // The user holds Ctrl+Shift+Space for the next Dictation while the last one pastes.
+        let held = HeldKeys {
+            ctrl: true,
+            shift: true,
+            ..NONE
+        };
+        assert_eq!(
+            paste_keys(false, held),
+            [
+                (VK_SHIFT, true),
+                (VK_V, false),
+                (VK_V, true),
+                (VK_SHIFT, false)
+            ]
+        );
     }
 
     #[test]

@@ -70,8 +70,7 @@ const TEMPLATE: &str = r#"# LiveTyper settings. Restart LiveTyper after a change
 # A key that is not in this file takes its default value.
 
 # Hold this key combination to dictate. Examples: "Ctrl+Space", "Ctrl+Alt+D", "F9".
-# If another app uses the key (for example, PowerToys Peek can use Ctrl+Space), the Talk Key
-# does not work and LiveTyper shows a warning. Then set a different key here.
+# LiveTyper sees this key before other apps, so an app with the same shortcut does not get it.
 talk_key = "Ctrl+Space"
 
 # Scratch Pad position: the center of its bottom edge, in screen pixels.
@@ -113,11 +112,7 @@ start_with_windows = true
 
 pub fn parse(text: &str) -> Result<Settings, String> {
     let settings: Settings = toml::from_str(text).map_err(|e| e.to_string())?;
-    if settings
-        .talk_key
-        .parse::<global_hotkey::hotkey::HotKey>()
-        .is_err()
-    {
+    if crate::hotkey::Chord::parse(&settings.talk_key).is_err() {
         return Err(format!(
             "talk_key: \"{}\" is not a key combination",
             settings.talk_key

@@ -60,17 +60,17 @@ fn models_dir_or_skip(test: &str) -> Option<PathBuf> {
     }
 }
 
-/// An engine and the events that it sends.
+/// An engine and the events that it sends, each with the time that it came.
 struct Rig {
     engine: Engine,
-    events: Receiver<EngineEvent>,
+    events: Receiver<(Instant, EngineEvent)>,
 }
 
 impl Rig {
     fn new(models_dir: PathBuf) -> Rig {
         let (sender, events) = mpsc::channel();
         let engine = Engine::new(config(models_dir), move |event| {
-            let _ = sender.send(event);
+            let _ = sender.send((Instant::now(), event));
         });
         Rig { engine, events }
     }
@@ -152,7 +152,7 @@ fn dictate(rig: &Rig, generation: u64, samples: &[f32], feed: Feed) -> Result<He
     }
 
     // All events in the channel now came before the release.
-    let mut events: Vec<EngineEvent> = rig.events.try_iter().collect();
+    let mut events: Vec<EngineEvent> = rig.events.try_iter().map(|(_, event)| event).collect();
     let before_release = events.len();
     audio.close();
     rig.engine.stop(generation);
@@ -162,7 +162,7 @@ fn dictate(rig: &Rig, generation: u64, samples: &[f32], feed: Feed) -> Result<He
     let release_to_final = loop {
         let left = deadline.saturating_duration_since(Instant::now());
         match rig.events.recv_timeout(left) {
-            Ok(event) => {
+            Ok((_, event)) => {
                 let done = generation_of(&event) == generation
                     && matches!(event, EngineEvent::Final { .. } | EngineEvent::Error { .. });
                 events.push(event);
@@ -390,7 +390,7 @@ fn a_cancelled_dictation_gives_no_final_text_and_the_next_one_works() {
     audio.close();
 
     let deadline = Instant::now() + Duration::from_secs(3);
-    while let Ok(event) = rig
+    while let Ok((_, event)) = rig
         .events
         .recv_timeout(deadline.saturating_duration_since(Instant::now()))
     {
@@ -468,7 +468,7 @@ fn missing_models_give_an_error_that_names_the_folder() {
     let deadline = Instant::now() + Duration::from_secs(10);
     loop {
         let left = deadline.saturating_duration_since(Instant::now());
-        match rig.events.recv_timeout(left).expect("an Error event") {
+        match rig.events.recv_timeout(left).expect("an Error event").1 {
             EngineEvent::Error {
                 generation,
                 message,
@@ -487,3 +487,5 @@ fn missing_models_give_an_error_that_names_the_folder() {
         }
     }
 }
+
+mod live_writing;

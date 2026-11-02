@@ -46,6 +46,11 @@ pub struct Stats {
     pub audio_ms: i64,
     pub load_ms: Option<u128>,
     pub first_text_ms: Option<u128>,
+    /// Where the speech starts in the audio (the first loud 100 ms), if there is speech.
+    pub speech_onset_ms: Option<i64>,
+    /// How much audio the live model had when the first word showed.
+    pub first_text_audio_ms: Option<i64>,
+    pub final_words: usize,
     pub recasts: u32,
     pub recast_total_ms: u128,
     pub final_recast_ms: Option<u128>,
@@ -153,6 +158,8 @@ struct RecastJob {
     /// The start of `pcm`: the boundary minus the context.
     start_ms: i64,
     end_ms: i64,
+    /// The last Recast of the Dictation: it has all of the audio.
+    last: bool,
     pcm: Vec<f32>,
 }
 
@@ -160,6 +167,7 @@ struct RecastResult {
     generation: u64,
     boundary_ms: i64,
     end_ms: i64,
+    last: bool,
     /// `None` if the decode failed. This is not the same as silence.
     words: Option<Vec<TimedWord>>,
     took_ms: u128,
@@ -241,6 +249,7 @@ fn recast_worker(mut session: Session, jobs: &Receiver<RecastJob>, results: &Sen
             generation: job.generation,
             boundary_ms: job.boundary_ms,
             end_ms: job.end_ms,
+            last: job.last,
             words,
             took_ms: started.elapsed().as_millis(),
         };
@@ -391,6 +400,7 @@ impl Dictation<'_> {
                             self.draft.set_live_text(&s.text().display(), at_ms.max(0));
                             if self.stats.first_text_ms.is_none() {
                                 self.stats.first_text_ms = Some(self.started.elapsed().as_millis());
+                                self.stats.first_text_audio_ms = Some(ms(fed));
                             }
                             self.publish();
                         }
@@ -417,7 +427,7 @@ impl Dictation<'_> {
                 && last_recast.elapsed() >= self.config.recast_interval
                 && self.audio.len() >= MIN_RECAST_SAMPLES
             {
-                recast_running = self.send_job(jobs, self.audio.len());
+                recast_running = self.send_job(jobs, self.audio.len(), false);
                 last_recast = Instant::now();
             }
 
@@ -447,8 +457,9 @@ impl Dictation<'_> {
 
         let end = self.audio.len();
         self.stats.audio_ms = ms(end);
+        self.stats.speech_onset_ms = speech_onset_ms(&self.audio.copy_range(0, end));
         let started = Instant::now();
-        let text = if self.send_job(jobs, end) {
+        let text = if self.send_job(jobs, end, true) {
             match self.wait_for_recast(results) {
                 Wait::Done(true) => {
                     self.stats.final_recast_ms = Some(started.elapsed().as_millis());
@@ -462,6 +473,7 @@ impl Dictation<'_> {
             // Too little new audio for a Recast: the Draft is already final.
             self.draft.view().full()
         };
+        self.stats.final_words = text.split_whitespace().count();
         (self.emit)(EngineEvent::Final {
             generation: self.generation,
             text,
@@ -502,7 +514,7 @@ impl Dictation<'_> {
 
     /// Sends a Recast of the audio from the fixed boundary to `end`, with context before the
     /// boundary. Returns false if there is too little audio after the boundary.
-    fn send_job(&mut self, jobs: &Sender<RecastJob>, end: usize) -> bool {
+    fn send_job(&mut self, jobs: &Sender<RecastJob>, end: usize, last: bool) -> bool {
         let end_ms = ms(end);
         let boundary_ms = self
             .draft
@@ -517,6 +529,7 @@ impl Dictation<'_> {
             boundary_ms,
             start_ms,
             end_ms,
+            last,
             pcm,
         })
         .is_ok()
@@ -546,9 +559,13 @@ impl Dictation<'_> {
             // A failed Recast changes nothing. The live words stay.
             return false;
         };
-        let applied = self
-            .draft
-            .apply_recast(result.boundary_ms, result.end_ms, words);
+        let applied = if result.last {
+            self.draft
+                .apply_last_recast(result.boundary_ms, result.end_ms, words)
+        } else {
+            self.draft
+                .apply_recast(result.boundary_ms, result.end_ms, words)
+        };
         self.publish();
         applied
     }
@@ -565,6 +582,24 @@ impl Dictation<'_> {
     }
 }
 
+/// The start of the first 100 ms of the audio that is 15 dB or more above the noise (the quietest
+/// tenth of the audio). For the log only.
+fn speech_onset_ms(samples: &[f32]) -> Option<i64> {
+    let db: Vec<f32> = samples
+        .chunks(CHUNK)
+        .map(|c| {
+            let rms = (c.iter().map(|s| s * s).sum::<f32>() / c.len() as f32).sqrt();
+            20.0 * rms.max(1e-9).log10()
+        })
+        .collect();
+    let mut sorted = db.clone();
+    sorted.sort_by(f32::total_cmp);
+    let noise = *sorted.get(sorted.len() / 10)?;
+    db.iter()
+        .position(|&d| d >= noise + 15.0)
+        .map(|i| ms(i * CHUNK))
+}
+
 fn ms(samples: usize) -> i64 {
     (samples * 1000 / SAMPLE_RATE) as i64
 }
@@ -576,6 +611,15 @@ fn samples(ms: i64) -> usize {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn speech_onset_is_the_first_loud_part() {
+        let mut audio = vec![0.001f32; SAMPLE_RATE];
+        audio.extend(vec![0.1f32; SAMPLE_RATE / 2]);
+        assert_eq!(speech_onset_ms(&audio), Some(1000));
+        assert_eq!(speech_onset_ms(&vec![0.001f32; SAMPLE_RATE]), None);
+        assert_eq!(speech_onset_ms(&[]), None);
+    }
 
     #[test]
     fn lookahead_maps_to_trained_right_context() {

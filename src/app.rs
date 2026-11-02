@@ -17,15 +17,15 @@ use windows::Win32::System::Threading::GetCurrentProcessId;
 use windows::Win32::UI::Accessibility::{HWINEVENTHOOK, SetWinEventHook};
 use windows::Win32::UI::WindowsAndMessaging::{
     CreateWindowExW, DefWindowProcW, DestroyWindow, DispatchMessageW, EVENT_SYSTEM_FOREGROUND,
-    GetClassNameW, GetMessageW, GetWindowThreadProcessId, IsWindow, KillTimer, MSG, PostMessageW,
-    PostQuitMessage, RegisterClassW, RegisterWindowMessageW, SetForegroundWindow, SetTimer,
-    TranslateMessage, WINDOW_EX_STYLE, WINDOW_STYLE, WINEVENT_OUTOFCONTEXT, WM_APP, WM_DESTROY,
-    WM_LBUTTONUP, WM_RBUTTONUP, WM_TIMER, WNDCLASSW,
+    GetClassNameW, GetForegroundWindow, GetMessageW, GetWindowThreadProcessId, IsWindow, KillTimer,
+    MSG, PostMessageW, PostQuitMessage, RegisterClassW, RegisterWindowMessageW,
+    SetForegroundWindow, SetTimer, TranslateMessage, WINDOW_EX_STYLE, WINDOW_STYLE,
+    WINEVENT_OUTOFCONTEXT, WM_APP, WM_DESTROY, WM_LBUTTONUP, WM_RBUTTONUP, WM_TIMER, WNDCLASSW,
 };
 use windows::core::{Result, w};
 
-use crate::audio::{AudioBuffer, Capture};
-use crate::dictation::{Action, Dictation, Event, State};
+use crate::audio::{AudioBuffer, Capture, SAMPLE_RATE};
+use crate::dictation::{Action, Dictation, Event, Next, State};
 use crate::draft::DraftView;
 use crate::engine::{Engine, EngineConfig, EngineEvent, Stats};
 use crate::hotkey::{Hotkeys, KeyEvent};
@@ -60,6 +60,9 @@ const IDLE_CHECK_MS: u32 = 60_000;
 /// A paste that takes longer (for example, a hung clipboard owner) no longer blocks the Talk Key.
 const PASTE_GUARD_MS: u32 = 5_000;
 const NOT_PASTED_MESSAGE: &str = "Not pasted. Push Ctrl+V.";
+/// A Dictation that starts this soon after the last paste into the same window is a follow-up:
+/// its text gets a space before it, so that it does not touch the last text.
+const FOLLOW_UP_WINDOW: Duration = Duration::from_secs(30);
 
 static EVENTS: OnceLock<Sender<UiEvent>> = OnceLock::new();
 static UI_HWND: AtomicIsize = AtomicIsize::new(0);
@@ -113,11 +116,15 @@ struct App {
     audio: Option<Arc<AudioBuffer>>,
     key_down_at: Instant,
     released_at: Instant,
+    /// When the Talk Key went up for the next Dictation, while the current one finished.
+    next_released_at: Option<Instant>,
     view: DraftView,
     final_text: Option<String>,
     stats: Option<Stats>,
     /// For Paste Last Dictation. In memory only.
     last_text: Option<String>,
+    /// The window of the last paste, and when the paste started.
+    last_paste: Option<(isize, Instant)>,
     last_activity: Instant,
     /// True until the engine reports that the models are ready, and again after an unload.
     models_unloaded: bool,
@@ -221,10 +228,12 @@ pub fn run(settings: Settings, startup_warning: Option<String>) -> Result<()> {
             audio: None,
             key_down_at: Instant::now(),
             released_at: Instant::now(),
+            next_released_at: None,
             view: DraftView::default(),
             final_text: None,
             stats: None,
             last_text: None,
+            last_paste: None,
             last_activity: Instant::now(),
             models_unloaded: true,
             deadline_waits_for_models: false,
@@ -354,6 +363,9 @@ impl App {
         match event {
             UiEvent::Key(KeyEvent::TalkDown) => {
                 self.key_down_at = Instant::now();
+                if self.dictation.next() == Next::Recorded {
+                    log::warn!("Talk Key push ignored: a next Dictation already waits");
+                }
                 self.step(Event::TalkKeyDown);
             }
             UiEvent::Key(KeyEvent::TalkUp) => {
@@ -379,7 +391,10 @@ impl App {
             UiEvent::Engine(EngineEvent::Draft { generation, view }) => {
                 if self.is_current(generation) {
                     self.view = view.clone();
-                    self.pad.set_draft(view);
+                    // While a next Dictation records, the Scratch Pad shows that one.
+                    if self.dictation.next() == Next::None {
+                        self.pad.set_draft(view);
+                    }
                 }
             }
             UiEvent::Engine(EngineEvent::Final {
@@ -398,12 +413,21 @@ impl App {
                 message,
             }) => {
                 if self.is_current(generation) {
+                    let had_next = self.dictation.next() != Next::None;
                     self.step(Event::Failed);
-                    self.show_message(message, Duration::from_secs(8));
+                    if had_next {
+                        log::error!("the last Dictation failed; the next one continues: {message}");
+                    } else {
+                        self.show_message(message, Duration::from_secs(8));
+                    }
                 }
             }
             UiEvent::MicrophoneError(message) => {
-                if matches!(self.dictation.state(), State::Recording | State::Finishing) {
+                if self.dictation.next() != Next::None {
+                    // The microphone records for the next Dictation: only that one stops.
+                    self.step(Event::Escape);
+                    self.show_message(message, Duration::from_secs(5));
+                } else if matches!(self.dictation.state(), State::Recording | State::Finishing) {
                     self.step(Event::Failed);
                     self.show_message(message, Duration::from_secs(5));
                 }
@@ -412,8 +436,11 @@ impl App {
                 if let Some(generation) = dictation {
                     if generation == self.generation && self.dictation.state() == State::Pasting {
                         self.kill_timer(TIMER_PASTE);
-                        self.step(Event::PasteDone);
                         self.log_dictation(result);
+                        if result == PasteResult::NotPasted && self.dictation.next() != Next::None {
+                            log::warn!("not pasted; the next Dictation shows, so no message");
+                        }
+                        self.step(Event::PasteDone);
                     } else {
                         log::info!("late paste result {result:?}: the paste guard ended it before");
                     }
@@ -475,14 +502,28 @@ impl App {
             }
             Action::Paste => {
                 let text = self.final_text.take().unwrap_or_else(|| self.view.full());
-                self.end_dictation();
-                self.pad.hide();
+                if self.dictation.next() == Next::None {
+                    self.end_dictation();
+                    self.pad.hide();
+                } else {
+                    // The next Dictation records: keep its microphone, Scratch Pad and Escape key.
+                    self.end_finishing();
+                }
                 if text.trim().is_empty() {
-                    log::info!("dictation: no speech, nothing to paste");
-                    self.dictation.handle(Event::PasteDone);
+                    match &self.stats {
+                        Some(s) => log::info!(
+                            "dictation: no text to paste; audio {:.1} s, speech starts at {}",
+                            s.audio_ms as f64 / 1000.0,
+                            s.speech_onset_ms
+                                .map_or("-".to_owned(), |ms| format!("{ms} ms"))
+                        ),
+                        None => log::info!("dictation: no text to paste"),
+                    }
+                    self.step(Event::PasteDone);
                     return;
                 }
                 self.last_text = Some(text.clone());
+                let text = self.with_follow_up_space(text);
                 let generation = self.generation;
                 paste::start(text, move |result| {
                     post(UiEvent::Pasted {
@@ -492,20 +533,105 @@ impl App {
                 });
                 unsafe { SetTimer(Some(self.hwnd), TIMER_PASTE, PASTE_GUARD_MS, None) };
             }
+            Action::StartNext => {
+                // The microphone opens now, so that no word is lost. The engine gets the audio
+                // when the last Dictation is pasted, and then decodes it faster than real time.
+                log::info!("next Dictation starts while the last one finishes");
+                let audio = Arc::new(AudioBuffer::default());
+                self.capture.start(audio.clone());
+                self.audio = Some(audio);
+                self.next_released_at = None;
+                self.set_escape(true);
+                self.kill_timer(TIMER_HIDE_MESSAGE);
+                self.pad.set_draft(DraftView::default());
+                self.pad.show(Status::Listening);
+                unsafe { SetTimer(Some(self.hwnd), TIMER_LEVEL, LEVEL_INTERVAL_MS, None) };
+                self.set_icon(IconState::Recording);
+            }
+            Action::CancelNext => {
+                self.capture.stop();
+                self.next_released_at = None;
+                log::info!("next Dictation cancelled");
+                if self.dictation.state() == State::Finishing {
+                    self.audio = None;
+                    self.kill_timer(TIMER_LEVEL);
+                    self.pad.set_draft(self.view.clone());
+                    self.pad.show(Status::Finishing);
+                    self.set_icon(IconState::Busy);
+                } else {
+                    // The last Dictation already pastes: end everything, as a paste without a next
+                    // Dictation does.
+                    self.end_dictation();
+                    self.pad.hide();
+                }
+            }
+            Action::FinishNext => {
+                self.capture.stop();
+                self.next_released_at = Some(Instant::now());
+                self.pad.set_status(Status::Finishing);
+                self.set_icon(IconState::Busy);
+            }
+            Action::Resume { cancel, recorded } => {
+                if cancel {
+                    self.engine.cancel(self.generation);
+                    self.end_finishing();
+                }
+                self.generation += 1;
+                let audio = self.audio.clone().unwrap_or_default();
+                self.engine.start(self.generation, audio.clone());
+                self.view = DraftView::default();
+                self.final_text = None;
+                self.stats = None;
+                if recorded {
+                    self.engine.stop(self.generation);
+                    self.released_at = self.next_released_at.take().unwrap_or_else(Instant::now);
+                    if self.models_unloaded {
+                        self.deadline_waits_for_models = true;
+                    } else {
+                        // The engine must first decode all of the recorded audio.
+                        let recorded_ms = (audio.len() * 1000 / SAMPLE_RATE) as u64;
+                        self.start_deadline_after(Duration::from_millis(recorded_ms));
+                    }
+                } else {
+                    self.set_icon(IconState::Recording);
+                }
+            }
         }
+    }
+
+    /// Adds a space before the text if it follows the last paste into the same window.
+    fn with_follow_up_space(&mut self, text: String) -> String {
+        let target = unsafe { GetForegroundWindow() }.0 as isize;
+        let audio =
+            Duration::from_millis(self.stats.as_ref().map_or(0, |s| s.audio_ms.max(0) as u64));
+        let follow_up = self
+            .last_paste
+            .is_some_and(|(hwnd, at)| hwnd == target && at.elapsed() < FOLLOW_UP_WINDOW + audio);
+        self.last_paste = Some((target, Instant::now()));
+        if follow_up && needs_space_before(&text) {
+            format!(" {text}")
+        } else {
+            text
+        }
+    }
+
+    /// Ends the parts of the Dictation that finishes, but not the next Dictation.
+    fn end_finishing(&mut self) {
+        self.kill_timer(TIMER_DEADLINE);
+        self.deadline_waits_for_models = false;
+        self.last_activity = Instant::now();
     }
 
     /// Starts the release deadline: after it, the current Draft pastes without the last Recast.
     fn start_deadline(&mut self) {
+        self.start_deadline_after(Duration::ZERO);
+    }
+
+    /// Starts the release deadline, longer by half of `audio` that the engine has not decoded yet.
+    fn start_deadline_after(&mut self, audio: Duration) {
         self.deadline_waits_for_models = false;
-        unsafe {
-            SetTimer(
-                Some(self.hwnd),
-                TIMER_DEADLINE,
-                self.settings.release_deadline_ms,
-                None,
-            )
-        };
+        let ms = self.settings.release_deadline_ms + (audio.as_millis() / 2) as u32;
+        unsafe { SetTimer(Some(self.hwnd), TIMER_DEADLINE, ms, None) };
     }
 
     fn end_dictation(&mut self) {
@@ -609,9 +735,13 @@ impl App {
                 } else {
                     "-".into()
                 };
+                let at = |v: Option<i64>| v.map_or("-".to_owned(), |ms| format!("{ms} ms"));
                 log::info!(
-                    "dictation: audio {:.1} s, load {}, first text {}, recasts {} (mean {}), last recast {}, paste {:?} {} ms after release",
+                    "dictation: audio {:.1} s, speech starts at {}, first word shown at {} of audio, {} words; load {}, first text {}, recasts {} (mean {}), last recast {}, paste {:?} {} ms after release",
                     s.audio_ms as f64 / 1000.0,
+                    at(s.speech_onset_ms),
+                    at(s.first_text_audio_ms),
+                    s.final_words,
                     optional(s.load_ms),
                     optional(s.first_text_ms),
                     s.recasts,
@@ -646,5 +776,25 @@ impl App {
         unsafe {
             let _ = KillTimer(Some(self.hwnd), id);
         }
+    }
+}
+
+/// True if a text that follows other text needs a space before it.
+fn needs_space_before(text: &str) -> bool {
+    text.chars()
+        .next()
+        .is_some_and(|c| !c.is_whitespace() && !".,;:!?)]}'\"".contains(c))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn a_follow_up_gets_a_space_unless_it_starts_with_punctuation() {
+        assert!(needs_space_before("This is attempt seven."));
+        assert!(!needs_space_before(", and then"));
+        assert!(!needs_space_before(" already"));
+        assert!(!needs_space_before(""));
     }
 }

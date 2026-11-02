@@ -271,6 +271,53 @@ mod tests {
         assert!((level(&[minus_30_db; 100]) - 0.5).abs() < 0.01);
     }
 
+    /// Opens the default microphone three times, one after the other, as follow-up Dictations do.
+    /// It prints the device, and for each 100 ms the RMS level and the largest sample, so that a
+    /// silent or quiet start of the stream shows. No audio is saved. Run it with:
+    /// `cargo test microphone_start_probe -- --ignored --nocapture`
+    #[test]
+    #[ignore = "uses the real microphone"]
+    fn microphone_start_probe() {
+        let host = cpal::default_host();
+        let device = host.default_input_device().expect("a microphone");
+        let config = device.default_input_config().expect("a microphone config");
+        println!(
+            "device: {:?}, config: {config:?}",
+            device.description().map(|d| d.name().to_owned())
+        );
+        for run in 1..=3 {
+            let buffer = Arc::new(AudioBuffer::default());
+            let opened = Instant::now();
+            let stream = open_microphone("", buffer.clone()).expect("open the microphone");
+            let open_ms = opened.elapsed().as_millis();
+            while buffer.len() == 0 && opened.elapsed() < Duration::from_secs(3) {
+                thread::sleep(Duration::from_millis(1));
+            }
+            let first_ms = opened.elapsed().as_millis();
+            thread::sleep(Duration::from_millis(1500).saturating_sub(opened.elapsed()));
+            drop(stream);
+            let samples = buffer.copy_range(0, buffer.len());
+            let line: Vec<String> = samples
+                .chunks(SAMPLE_RATE / 10)
+                .map(|c| {
+                    let rms = (c.iter().map(|s| s * s).sum::<f32>() / c.len() as f32).sqrt();
+                    let peak = c.iter().fold(0f32, |m, s| m.max(s.abs()));
+                    format!(
+                        "{:.0}/{:.0}",
+                        20.0 * rms.max(1e-9).log10(),
+                        20.0 * peak.max(1e-9).log10()
+                    )
+                })
+                .collect();
+            println!(
+                "run {run}: open {open_ms} ms, first samples after {first_ms} ms, {} ms of audio in {} ms",
+                samples.len() * 1000 / SAMPLE_RATE,
+                opened.elapsed().as_millis()
+            );
+            println!("  dB per 100 ms (rms/peak): {}", line.join(" "));
+        }
+    }
+
     #[test]
     fn buffer_copies_ranges_safely() {
         let b = AudioBuffer::default();

@@ -9,6 +9,11 @@
 //!
 //! The fixed boundary moves only in big steps, and if possible into a pause. Each Recast also decodes
 //! some audio before the boundary as context, but keeps only the words after the boundary.
+//!
+//! A Recast while the user speaks does not check the words at the end of its audio: the audio can
+//! end in the middle of a word, and then the Recast guesses words that the user did not say. Those
+//! words stay Unchecked Words until a later Recast has more audio after them. The last Recast, after
+//! the release of the Talk Key, has all of the audio and checks all of the words.
 
 /// A word with its start and end time, in ms from the start of the Dictation.
 #[derive(Debug, Clone, PartialEq)]
@@ -50,11 +55,15 @@ pub struct Draft {
     live: Vec<LiveWord>,
 }
 
-/// The most words at the end of the checked words that can show again at the start of the Unchecked Words.
-const MAX_BOUNDARY_REPEAT: usize = 3;
-/// A live word can repeat a checked word only if its time is less than this after the end of the
-/// last Recast. A later live word that is the same is a new word.
-const REPEAT_TOLERANCE_MS: i64 = 400;
+/// The live words have only approximate times. To find where the Unchecked Words start, this many
+/// of the last checked words are matched by text to the live words.
+const MATCH_WORDS: usize = 12;
+/// Only live words that showed before this long after the end of the checked words can match a
+/// checked word. A later live word that is the same is a new word.
+const MATCH_WINDOW_MS: i64 = 1000;
+/// A live word without a match can take the place of a checked word without a match (a Recast
+/// correction) only if it showed before this long after the end of the checked words.
+const REPLACE_TOLERANCE_MS: i64 = 400;
 /// A gap between two checked words of this length or more is a pause.
 const MIN_PAUSE_MS: i64 = 150;
 /// The fixed boundary stays this far from the words on the two sides of a gap.
@@ -62,8 +71,15 @@ const GAP_MARGIN_MS: i64 = 200;
 /// The fixed boundary stays this far before the end of the last Recast. A word at the end of the
 /// Recast audio can be cut, so the Recast can miss it.
 const TAIL_GUARD_MS: i64 = 1000;
+/// A Recast while the user speaks checks only the words that end at least this long before the end
+/// of its audio.
+const SETTLE_HOLD_MS: i64 = 1000;
+/// The end of the checked words goes into the longest pause in this range before the hold.
+const SETTLE_PAUSE_SEARCH_MS: i64 = 1000;
 
-/// A position where the fixed boundary can go: between `fix` checked words and the next words.
+/// A position between `fix` words and the next words: for the fixed boundary, or for the end of the
+/// checked words.
+#[derive(Clone, Copy)]
 struct Cut {
     at_ms: i64,
     gap_ms: i64,
@@ -154,19 +170,81 @@ impl Draft {
         cuts
     }
 
-    /// Applies the words of a Recast for the fixed boundary `boundary_ms`, up to `end_ms`. The word
-    /// times must already count from the start of the Dictation. The words before the boundary
-    /// (the context) are dropped. Returns false, and changes nothing, if the boundary is old.
+    /// Applies the words of a Recast while the user speaks, for the fixed boundary `boundary_ms`, up
+    /// to `end_ms`. The word times must already count from the start of the Dictation. The words
+    /// before the boundary (the context) are dropped. Only the words before a settled point, at
+    /// least `SETTLE_HOLD_MS` before `end_ms`, become checked. A checked word that the Scratch Pad
+    /// already shows keeps its text if the Recast changes only its form (see `keep_shown_forms`).
+    /// Returns false, and changes nothing, if the boundary is old.
     pub fn apply_recast(&mut self, boundary_ms: i64, end_ms: i64, words: Vec<TimedWord>) -> bool {
         if boundary_ms != self.fixed_until_ms {
             return false;
         }
-        self.checked = words
-            .into_iter()
-            .filter(|w| (w.t0_ms + w.t1_ms) / 2 >= boundary_ms)
-            .collect();
+        let mut words = after_boundary(words, boundary_ms);
+        if let Some(cut) = self.settled_cut(&words, end_ms) {
+            words.truncate(cut.fix);
+            self.checked = keep_shown_forms(&self.checked, words);
+            self.checked_until_ms = cut.at_ms;
+        }
+        true
+    }
+
+    /// Applies the words of the last Recast, which has all of the audio up to `end_ms`. All of its
+    /// words after the boundary become checked, in the form that the Recast gives.
+    /// Returns false, and changes nothing, if the boundary is old.
+    pub fn apply_last_recast(
+        &mut self,
+        boundary_ms: i64,
+        end_ms: i64,
+        words: Vec<TimedWord>,
+    ) -> bool {
+        if boundary_ms != self.fixed_until_ms {
+            return false;
+        }
+        self.checked = after_boundary(words, boundary_ms);
         self.checked_until_ms = end_ms;
         true
+    }
+
+    /// Where the checked words of a Recast up to `end_ms` end: after the last word that ends
+    /// `SETTLE_HOLD_MS` or more before `end_ms`, or earlier. A pause near the hold is better, because there the
+    /// live words and the Recast words separate cleanly. The end does not move back if possible.
+    /// `None` if the Recast has too little audio after the boundary.
+    fn settled_cut(&self, words: &[TimedWord], end_ms: i64) -> Option<Cut> {
+        let limit = end_ms - SETTLE_HOLD_MS;
+        let mut cuts = Vec::new();
+        let mut last_end = self.fixed_until_ms;
+        for fix in 0..=words.len() {
+            if last_end > limit {
+                break;
+            }
+            let next_start = words.get(fix).map_or(limit, |w| w.t0_ms.min(limit));
+            // A cut inside a number ("nine | thirty") is not permitted: the live model can show
+            // the number as one word ("9:30").
+            let in_number = fix > 0
+                && words
+                    .get(fix)
+                    .is_some_and(|w| is_number(&words[fix - 1].text) && is_number(&w.text));
+            if !in_number {
+                cuts.push(Cut {
+                    at_ms: next_start.max(last_end),
+                    gap_ms: (next_start - last_end).max(0),
+                    fix,
+                });
+            }
+            if let Some(w) = words.get(fix) {
+                last_end = w.t1_ms;
+            }
+        }
+        let forward: Vec<&Cut> = cuts
+            .iter()
+            .filter(|c| c.at_ms >= self.checked_until_ms)
+            .collect();
+        let pause = forward
+            .iter()
+            .filter(|c| c.at_ms >= limit - SETTLE_PAUSE_SEARCH_MS && c.gap_ms >= MIN_PAUSE_MS)
+            .max_by_key(|c| (c.gap_ms, c.at_ms));
+        pause.or(forward.last()).copied().or(cuts.last()).copied()
     }
 
     pub fn view(&self) -> DraftView {
@@ -176,26 +254,7 @@ impl Draft {
             .map(String::as_str)
             .chain(self.checked.iter().map(|w| w.text.as_str()))
             .collect();
-        let mut unchecked: Vec<&LiveWord> = self
-            .live
-            .iter()
-            .filter(|w| w.at_ms >= self.checked_until_ms)
-            .collect();
-
-        // A word near the end of the Recast window can show in both lists. Remove the repeat, but
-        // only near the end of the Recast: a later word that is the same is a new word.
-        let max = MAX_BOUNDARY_REPEAT.min(checked.len()).min(unchecked.len());
-        let repeat = (1..=max)
-            .rev()
-            .find(|&k| {
-                (0..k).all(|i| {
-                    unchecked[i].at_ms < self.checked_until_ms + REPEAT_TOLERANCE_MS
-                        && same_word(checked[checked.len() - k + i], &unchecked[i].text)
-                })
-            })
-            .unwrap_or(0);
-        unchecked.drain(..repeat);
-
+        let unchecked = &self.live[self.unchecked_start(&checked)..];
         DraftView {
             checked: checked.join(" "),
             unchecked: unchecked
@@ -204,6 +263,58 @@ impl Draft {
                 .collect::<Vec<_>>()
                 .join(" "),
         }
+    }
+
+    /// The index of the first Unchecked Word in the live words. The last checked words are matched
+    /// by text to the live words near the end of the checked words. The live words after the last
+    /// match are Unchecked Words, except those that take the place of checked words after the last
+    /// match (a Recast correction). Without a match, the times decide.
+    fn unchecked_start(&self, checked: &[&str]) -> usize {
+        if checked.is_empty() {
+            return 0;
+        }
+        let until = self.checked_until_ms;
+        let near = self
+            .live
+            .iter()
+            .take_while(|w| w.at_ms < until + MATCH_WINDOW_MS)
+            .count();
+        let first = near.saturating_sub(MATCH_WORDS * 2);
+        let tail = &checked[checked.len().saturating_sub(MATCH_WORDS)..];
+        let a: Vec<String> = tail.iter().map(|w| normal_word(w)).collect();
+        let b: Vec<String> = self.live[first..near]
+            .iter()
+            .map(|w| normal_word(&w.text))
+            .collect();
+        let Some(&(i, j)) = common_words(&a, &b).last() else {
+            return self
+                .live
+                .iter()
+                .position(|w| w.at_ms >= until)
+                .unwrap_or(self.live.len());
+        };
+        let start = first + j + 1;
+        // The checked words after the last match, as "9 30" for the live "9:30".
+        let rest = a[i + 1..].concat();
+        let mut joined = String::new();
+        for (k, w) in self.live[start..near].iter().enumerate() {
+            if joined == rest {
+                return start + k;
+            }
+            joined.push_str(&normal_word(&w.text));
+            if joined.len() > rest.len() {
+                break;
+            }
+        }
+        if joined == rest {
+            return near;
+        }
+        let replaced = self.live[start..]
+            .iter()
+            .take(tail.len() - i - 1)
+            .take_while(|w| w.at_ms < until + REPLACE_TOLERANCE_MS)
+            .count();
+        start + replaced
     }
 
     /// The text after the last Recast covered all of the audio: the live words are not needed.
@@ -217,20 +328,100 @@ impl Draft {
     }
 }
 
-/// True if two words are the same, also when one is a number in digits and the other in letters.
-fn same_word(a: &str, b: &str) -> bool {
-    let normal = |s: &str| -> String {
-        let word: String = s
-            .chars()
-            .filter(|c| c.is_alphanumeric())
-            .flat_map(char::to_lowercase)
-            .collect();
-        match number_word(&word) {
-            Some(n) => n.to_string(),
-            None => word,
+/// The words of a Recast whose middle is at or after the boundary.
+fn after_boundary(words: Vec<TimedWord>, boundary_ms: i64) -> Vec<TimedWord> {
+    words
+        .into_iter()
+        .filter(|w| (w.t0_ms + w.t1_ms) / 2 >= boundary_ms)
+        .collect()
+}
+
+/// Returns the `new` checked words, but where they differ from the `shown` checked words only in
+/// form (case, punctuation, or digits against letters, as "9:30" and "nine thirty"), the shown words
+/// stay. So the Scratch Pad changes a checked word only when a Recast hears a different word.
+fn keep_shown_forms(shown: &[TimedWord], new: Vec<TimedWord>) -> Vec<TimedWord> {
+    let a: Vec<String> = shown.iter().map(|w| normal_word(&w.text)).collect();
+    let b: Vec<String> = new.iter().map(|w| normal_word(&w.text)).collect();
+    let mut out = Vec::with_capacity(new.len());
+    // A run of words between two matches. If the start (or the end) of the new run has the same
+    // letters and digits as the shown run, the shown run stays, and the other new words are added.
+    let flush = |out: &mut Vec<TimedWord>, (i0, i): (usize, usize), (j0, j): (usize, usize)| {
+        let old = a[i0..i].concat();
+        let run = &b[j0..j];
+        if i > i0 {
+            if let Some(k) = (0..=run.len()).find(|&k| run[..k].concat() == old) {
+                out.extend_from_slice(&shown[i0..i]);
+                out.extend_from_slice(&new[j0 + k..j]);
+                return;
+            }
+            if let Some(k) = (0..=run.len()).find(|&k| run[k..].concat() == old) {
+                out.extend_from_slice(&new[j0..j0 + k]);
+                out.extend_from_slice(&shown[i0..i]);
+                return;
+            }
         }
+        out.extend_from_slice(&new[j0..j]);
     };
-    normal(a) == normal(b)
+    let (mut i0, mut j0) = (0, 0);
+    for (i, j) in common_words(&a, &b) {
+        flush(&mut out, (i0, i), (j0, j));
+        out.push(TimedWord {
+            text: shown[i].text.clone(),
+            ..new[j].clone()
+        });
+        (i0, j0) = (i + 1, j + 1);
+    }
+    flush(&mut out, (i0, a.len()), (j0, b.len()));
+    out
+}
+
+/// The pairs (i, j) of a longest common subsequence of `a` and `b`, in order. Of two equal
+/// choices, it skips a word of `a` first, so the matches in `b` come as early as possible.
+fn common_words(a: &[String], b: &[String]) -> Vec<(usize, usize)> {
+    // common[i][j]: the length of the longest common subsequence of a[i..] and b[j..].
+    let mut common = vec![vec![0usize; b.len() + 1]; a.len() + 1];
+    for i in (0..a.len()).rev() {
+        for j in (0..b.len()).rev() {
+            common[i][j] = if a[i] == b[j] {
+                common[i + 1][j + 1] + 1
+            } else {
+                common[i + 1][j].max(common[i][j + 1])
+            };
+        }
+    }
+    let mut pairs = Vec::with_capacity(common[0][0]);
+    let (mut i, mut j) = (0, 0);
+    while i < a.len() && j < b.len() {
+        if a[i] == b[j] {
+            pairs.push((i, j));
+            i += 1;
+            j += 1;
+        } else if common[i + 1][j] >= common[i][j + 1] {
+            i += 1;
+        } else {
+            j += 1;
+        }
+    }
+    pairs
+}
+
+/// True if the word is a number, in digits or in letters.
+fn is_number(s: &str) -> bool {
+    let word = normal_word(s);
+    !word.is_empty() && word.chars().all(|c| c.is_ascii_digit())
+}
+
+/// A word in lower case, without punctuation, and with a number word as digits.
+fn normal_word(s: &str) -> String {
+    let word: String = s
+        .chars()
+        .filter(|c| c.is_alphanumeric())
+        .flat_map(char::to_lowercase)
+        .collect();
+    match number_word(&word) {
+        Some(n) => n.to_string(),
+        None => word,
+    }
 }
 
 /// The value of a number word from "zero" to "twenty", or of a ten such as "forty".
@@ -304,7 +495,7 @@ mod tests {
         d.set_live_text("hello there", 400);
         d.set_live_text("hello there how are", 1400);
         assert_eq!(d.next_window_start(1000, 15_000), 0);
-        d.apply_recast(0, 1000, words(&[("Hello", 100, 400), ("there,", 400, 800)]));
+        d.apply_last_recast(0, 1000, words(&[("Hello", 100, 400), ("there,", 400, 800)]));
         assert_eq!(d.view(), view("Hello there,", "how are"));
         assert_eq!(d.view().full(), "Hello there, how are");
     }
@@ -314,7 +505,7 @@ mod tests {
         let mut d = Draft::default();
         d.set_live_text("we will review", 900);
         d.set_live_text("we will review the budget", 1700);
-        d.apply_recast(
+        d.apply_last_recast(
             0,
             1200,
             words(&[("We", 0, 200), ("will", 200, 400), ("review", 400, 900)]),
@@ -325,7 +516,7 @@ mod tests {
         let mut d = Draft::default();
         d.set_live_text("we will", 300);
         d.set_live_text("we will review the", 1300);
-        d.apply_recast(
+        d.apply_last_recast(
             0,
             1200,
             words(&[("We", 0, 200), ("will", 200, 400), ("review.", 400, 1100)]),
@@ -339,7 +530,7 @@ mod tests {
         let mut d = Draft::default();
         d.set_live_text("I red", 500);
         d.set_live_text("I read the", 2000);
-        d.apply_recast(0, 1000, words(&[("I", 0, 200), ("read", 200, 600)]));
+        d.apply_last_recast(0, 1000, words(&[("I", 0, 200), ("read", 200, 600)]));
         assert_eq!(d.view(), view("I read", "the"));
     }
 
@@ -354,7 +545,7 @@ mod tests {
     #[test]
     fn the_boundary_stays_while_the_window_is_short() {
         let mut d = Draft::default();
-        d.apply_recast(0, 14_000, words(&[("a", 0, 1000), ("b", 5000, 6000)]));
+        d.apply_last_recast(0, 14_000, words(&[("a", 0, 1000), ("b", 5000, 6000)]));
         assert_eq!(d.next_window_start(15_000, 15_000), 0);
         assert_eq!(d.view(), view("a b", ""));
     }
@@ -362,7 +553,7 @@ mod tests {
     #[test]
     fn the_boundary_moves_in_a_big_step_into_the_longest_pause() {
         let mut d = Draft::default();
-        d.apply_recast(
+        d.apply_last_recast(
             0,
             19_500,
             words(&[
@@ -382,7 +573,7 @@ mod tests {
         assert_eq!(d.next_window_start(9000, 15_000), 8200);
 
         // The Recast audio starts before the boundary. Its words there ("b") are only context.
-        assert!(d.apply_recast(
+        assert!(d.apply_last_recast(
             8200,
             22_000,
             words(&[
@@ -403,17 +594,17 @@ mod tests {
         let spec: Vec<(&str, i64, i64)> = (0..19_i64)
             .map(|i| (names[i as usize].as_str(), i * 1000, (i + 1) * 1000))
             .collect();
-        d.apply_recast(0, 19_500, words(&spec));
+        d.apply_last_recast(0, 19_500, words(&spec));
         assert_eq!(d.next_window_start(20_000, 15_000), 10_000);
         // Ten words are fixed. A Recast without words removes only the checked words.
-        assert!(d.apply_recast(10_000, 20_000, Vec::new()));
+        assert!(d.apply_last_recast(10_000, 20_000, Vec::new()));
         assert_eq!(d.final_text(), "w0 w1 w2 w3 w4 w5 w6 w7 w8 w9");
     }
 
     #[test]
     fn a_long_pause_before_the_first_checked_word_leaves_the_window() {
         let mut d = Draft::default();
-        d.apply_recast(0, 29_500, words(&[("late", 20_000, 21_000)]));
+        d.apply_last_recast(0, 29_500, words(&[("late", 20_000, 21_000)]));
         // The pause from 0 to 20 000 is the longest gap: the boundary goes 200 ms before "late".
         assert_eq!(d.next_window_start(30_000, 15_000), 19_800);
         assert_eq!(d.view(), view("late", ""));
@@ -422,7 +613,7 @@ mod tests {
     #[test]
     fn silence_moves_the_boundary() {
         let mut d = Draft::default();
-        d.apply_recast(0, 20_000, Vec::new());
+        d.apply_last_recast(0, 20_000, Vec::new());
         assert_eq!(d.next_window_start(20_000, 15_000), 10_000);
         // Without a Recast, nothing is known about the audio, so the boundary stays.
         let mut d = Draft::default();
@@ -432,7 +623,7 @@ mod tests {
     #[test]
     fn a_long_word_is_never_cut() {
         let mut d = Draft::default();
-        d.apply_recast(0, 20_000, words(&[("long", 1000, 19_000)]));
+        d.apply_last_recast(0, 20_000, words(&[("long", 1000, 19_000)]));
         // The only position is in the silence before the word.
         assert_eq!(d.next_window_start(20_000, 15_000), 800);
         assert_eq!(d.view(), view("long", ""));
@@ -442,7 +633,7 @@ mod tests {
     fn the_end_of_the_last_recast_is_not_fixed() {
         let mut d = Draft::default();
         // The Recast is far behind the audio. The last 1000 ms of its audio can hold a cut word.
-        d.apply_recast(0, 11_000, words(&[("a", 0, 1000)]));
+        d.apply_last_recast(0, 11_000, words(&[("a", 0, 1000)]));
         assert_eq!(d.next_window_start(30_000, 15_000), 9800);
         assert_eq!(d.final_text(), "a");
     }
@@ -450,9 +641,9 @@ mod tests {
     #[test]
     fn a_result_for_an_old_boundary_is_ignored() {
         let mut d = Draft::default();
-        d.apply_recast(0, 20_000, words(&[("a", 0, 1000), ("b", 12_000, 13_000)]));
+        d.apply_last_recast(0, 20_000, words(&[("a", 0, 1000), ("b", 12_000, 13_000)]));
         assert_eq!(d.next_window_start(20_000, 15_000), 10_000);
-        assert!(!d.apply_recast(0, 20_500, words(&[("x", 0, 1000)])));
+        assert!(!d.apply_last_recast(0, 20_500, words(&[("x", 0, 1000)])));
         assert_eq!(d.view(), view("a b", ""));
     }
 
@@ -461,7 +652,7 @@ mod tests {
         let mut d = Draft::default();
         d.set_live_text("I said no", 900);
         d.set_live_text("I said no no means no", 3000);
-        d.apply_recast(
+        d.apply_last_recast(
             0,
             1200,
             words(&[("I", 0, 200), ("said", 200, 500), ("no.", 600, 900)]),
@@ -475,7 +666,7 @@ mod tests {
         let mut d = Draft::default();
         d.set_live_text("at", 300);
         d.set_live_text("at 10 sharp", 1300);
-        d.apply_recast(0, 1200, words(&[("at", 0, 300), ("ten", 400, 1100)]));
+        d.apply_last_recast(0, 1200, words(&[("at", 0, 300), ("ten", 400, 1100)]));
         assert_eq!(d.view(), view("at ten", "sharp"));
     }
 
@@ -483,16 +674,246 @@ mod tests {
     fn final_text_ignores_live_words() {
         let mut d = Draft::default();
         d.set_live_text("helo wrld", 5000);
-        d.apply_recast(0, 2000, words(&[("Hello", 0, 500), ("world.", 500, 1500)]));
+        d.apply_last_recast(0, 2000, words(&[("Hello", 0, 500), ("world.", 500, 1500)]));
         assert_eq!(d.final_text(), "Hello world.");
     }
 
     #[test]
-    fn same_word_ignores_case_and_punctuation() {
-        assert!(same_word("Hello,", "hello"));
-        assert!(!same_word("hello", "help"));
-        assert!(same_word("10", "ten"));
-        assert!(same_word("Forty.", "40"));
-        assert!(!same_word("one", "11"));
+    fn a_recast_does_not_check_the_end_of_its_audio() {
+        let mut d = Draft::default();
+        d.set_live_text("we will", 700);
+        d.set_live_text("we will review the", 1700);
+        d.set_live_text("we will review the budget", 2800);
+        // The audio ends in "budget", so the Recast guesses "remote". The words that end less than
+        // 1000 ms before the end of the audio are not checked.
+        assert!(d.apply_recast(
+            0,
+            3000,
+            words(&[
+                ("We", 0, 300),
+                ("will", 300, 600),
+                ("review", 700, 1200),
+                ("the", 1300, 1500),
+                ("remote", 1600, 2900),
+            ]),
+        ));
+        assert_eq!(d.view(), view("We will review the", "budget"));
+        // The last Recast has all of the audio and checks all of its words.
+        assert!(d.apply_last_recast(
+            0,
+            3200,
+            words(&[
+                ("We", 0, 300),
+                ("will", 300, 600),
+                ("review", 700, 1200),
+                ("the", 1300, 1500),
+                ("budget.", 1600, 2100),
+            ]),
+        ));
+        assert_eq!(d.final_text(), "We will review the budget.");
+    }
+
+    #[test]
+    fn the_checked_words_end_in_a_pause_near_the_hold() {
+        let mut d = Draft::default();
+        d.set_live_text("a b", 1200);
+        d.set_live_text("a b c d", 2500);
+        assert!(d.apply_recast(
+            0,
+            3400,
+            words(&[
+                ("a", 0, 500),
+                ("b", 600, 1000),
+                ("c", 1500, 1900),
+                ("d", 1950, 2300)
+            ]),
+        ));
+        // "d" ends before the hold (2400), but the pause after "b" is near: the words end there.
+        assert_eq!(d.view(), view("a b", "c d"));
+    }
+
+    #[test]
+    fn the_end_of_the_checked_words_does_not_move_back() {
+        let mut d = Draft::default();
+        // No pause near the hold (2000): the checked words end after "d".
+        assert!(d.apply_recast(
+            0,
+            3000,
+            words(&[
+                ("a", 0, 500),
+                ("b", 600, 1000),
+                ("c", 1050, 1500),
+                ("d", 1550, 1950)
+            ]),
+        ));
+        assert_eq!(d.view(), view("a b c d", ""));
+        // Now there is a pause before "c", but "c" and "d" are already checked: they stay checked.
+        assert!(d.apply_recast(
+            0,
+            3300,
+            words(&[
+                ("a", 0, 500),
+                ("b", 600, 1000),
+                ("c", 1300, 1500),
+                ("d", 1550, 1950),
+                ("e", 2000, 2900),
+            ]),
+        ));
+        assert_eq!(d.view(), view("a b c d", ""));
+    }
+
+    #[test]
+    fn a_recast_that_changes_only_the_form_keeps_the_shown_words() {
+        let mut d = Draft::default();
+        assert!(d.apply_recast(
+            0,
+            3000,
+            words(&[("at", 0, 300), ("nine", 400, 700), ("thirty.", 700, 1100)]),
+        ));
+        assert_eq!(d.view(), view("at nine thirty.", ""));
+        assert!(d.apply_recast(
+            0,
+            3500,
+            words(&[
+                ("At", 0, 300),
+                ("9:30", 400, 1100),
+                ("tomorrow", 1200, 1600)
+            ]),
+        ));
+        assert_eq!(d.view(), view("at nine thirty. tomorrow", ""));
+        assert!(d.apply_recast(
+            0,
+            4000,
+            words(&[
+                ("At", 0, 300),
+                ("9", 400, 700),
+                ("30", 700, 1100),
+                ("tomorrow.", 1200, 1600)
+            ]),
+        ));
+        assert_eq!(d.view(), view("at nine thirty. tomorrow", ""));
+        // The last Recast gives the final form.
+        assert!(d.apply_last_recast(
+            0,
+            4000,
+            words(&[
+                ("At", 0, 300),
+                ("9:30", 400, 1100),
+                ("tomorrow.", 1200, 1600)
+            ]),
+        ));
+        assert_eq!(d.final_text(), "At 9:30 tomorrow.");
+    }
+
+    #[test]
+    fn a_recast_that_hears_a_different_word_changes_it() {
+        let mut d = Draft::default();
+        assert!(d.apply_recast(
+            0,
+            3000,
+            words(&[("open", 0, 400), ("the", 500, 700), ("winter", 800, 1400)]),
+        ));
+        assert!(d.apply_recast(
+            0,
+            3500,
+            words(&[("Open", 0, 400), ("the", 500, 700), ("windows.", 800, 1400)]),
+        ));
+        assert_eq!(d.view(), view("open the windows.", ""));
+    }
+
+    #[test]
+    fn a_live_word_that_showed_early_is_not_lost() {
+        let mut d = Draft::default();
+        d.set_live_text("make sure the remote has fresh", 9300);
+        // The start of "batteries" showed early: its time is before the end of the checked words.
+        d.set_live_text("make sure the remote has fresh bat", 9600);
+        assert!(d.apply_recast(
+            0,
+            10_800,
+            words(&[
+                ("make", 7000, 7200),
+                ("sure", 7200, 7500),
+                ("the", 7500, 7700),
+                ("remote", 7700, 8200),
+                ("has", 8300, 8600),
+                ("fresh", 8600, 9000),
+                ("batteries?", 9650, 10_500),
+            ]),
+        ));
+        assert_eq!(d.view(), view("make sure the remote has fresh", "bat"));
+    }
+
+    #[test]
+    fn a_live_word_that_a_recast_corrected_does_not_show_again() {
+        let mut d = Draft::default();
+        d.set_live_text("hiring two more drivers for the", 15_500);
+        d.set_live_text("hiring two more drivers for the winner", 16_600);
+        d.set_live_text("hiring two more drivers for the winner if there", 17_900);
+        assert!(d.apply_last_recast(
+            0,
+            16_700,
+            words(&[
+                ("hiring", 13_000, 13_400),
+                ("two", 13_400, 13_700),
+                ("more", 13_700, 14_000),
+                ("drivers", 14_000, 14_600),
+                ("for", 14_600, 14_800),
+                ("the", 14_800, 15_000),
+                ("winter.", 15_100, 16_500),
+            ]),
+        ));
+        assert_eq!(
+            d.view(),
+            view("hiring two more drivers for the winter.", "if there")
+        );
+    }
+
+    #[test]
+    fn the_checked_words_do_not_end_inside_a_number() {
+        let mut d = Draft::default();
+        d.set_live_text("starts at", 900);
+        d.set_live_text("starts at 9:30 in", 2300);
+        // "nine" ends before the hold (1900), "thirty" does not. The cut cannot go between them.
+        assert!(d.apply_recast(
+            0,
+            2900,
+            words(&[
+                ("starts", 0, 500),
+                ("at", 600, 800),
+                ("nine", 900, 1300),
+                ("thirty", 1350, 2000)
+            ]),
+        ));
+        assert_eq!(d.view(), view("starts at", "9:30 in"));
+        // When the Recast checks the number, the live "9:30" is not shown again.
+        assert!(d.apply_recast(
+            0,
+            3400,
+            words(&[
+                ("starts", 0, 500),
+                ("at", 600, 800),
+                ("nine", 900, 1300),
+                ("thirty", 1350, 2000)
+            ]),
+        ));
+        assert_eq!(d.view(), view("starts at nine thirty", "in"));
+    }
+
+    #[test]
+    fn the_first_live_words_show_before_a_recast_checks_a_word() {
+        let mut d = Draft::default();
+        d.set_live_text("The", 50);
+        assert!(d.apply_recast(0, 1200, words(&[("The", 100, 300)])));
+        // The Recast checks nothing yet (the hold), but its first word starts after the live "The".
+        assert_eq!(d.view(), view("", "The"));
+    }
+
+    #[test]
+    fn normal_word_ignores_case_punctuation_and_number_form() {
+        assert_eq!(normal_word("Hello,"), normal_word("hello"));
+        assert_ne!(normal_word("hello"), normal_word("help"));
+        assert_eq!(normal_word("10"), normal_word("ten"));
+        assert_eq!(normal_word("Forty."), normal_word("40"));
+        assert_ne!(normal_word("one"), normal_word("11"));
     }
 }
