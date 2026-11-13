@@ -6,6 +6,19 @@
 
 use std::time::Duration;
 
+use crate::draft::{DraftView, has_words};
+
+/// A completed engine selection is authoritative, including an empty result.
+/// Without one, the insertion deadline uses the latest draft with words.
+pub fn insertion_text(final_text: Option<String>, draft: &DraftView) -> String {
+    let text = final_text.unwrap_or_else(|| draft.full());
+    if has_words(&text) {
+        text
+    } else {
+        String::new()
+    }
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum State {
     Idle,
@@ -153,6 +166,34 @@ mod tests {
 
     fn machine() -> Dictation {
         Dictation::new(Duration::from_millis(300))
+    }
+
+    #[test]
+    fn deadline_fallback_requires_words_and_empty_final_is_authoritative() {
+        let draft = DraftView {
+            checked: "Friday".into(),
+            unchecked: String::new(),
+        };
+        assert_eq!(insertion_text(None, &draft), "Friday");
+        assert_eq!(insertion_text(Some(String::new()), &draft), "");
+        let punctuation = DraftView {
+            checked: "…".into(),
+            unchecked: String::new(),
+        };
+        assert_eq!(insertion_text(None, &punctuation), "");
+    }
+
+    #[test]
+    fn deadline_and_late_final_can_only_select_once() {
+        let mut d = Dictation::new(Duration::ZERO);
+        d.handle(Event::TalkKeyDown);
+        d.handle(Event::TalkKeyUp {
+            held: Duration::ZERO,
+        });
+        assert_eq!(d.handle(Event::DraftFinal), Action::Paste);
+        assert_eq!(d.handle(Event::DraftFinal), Action::None);
+        d.handle(Event::PasteDone);
+        assert_eq!(d.handle(Event::DraftFinal), Action::None);
     }
 
     #[test]

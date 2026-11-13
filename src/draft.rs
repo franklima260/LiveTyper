@@ -114,8 +114,20 @@ impl Draft {
     /// fixed. The boundary goes into the longest pause in the permitted range, or else between the
     /// two words nearest the target. It never goes inside a word, and never back.
     pub fn next_window_start(&mut self, audio_end_ms: i64, window_ms: i64) -> i64 {
+        if let Some(cut) = self.window_cut(audio_end_ms, window_ms) {
+            self.fix_through(cut);
+        }
+        self.fixed_until_ms
+    }
+
+    pub fn planned_window_start(&self, audio_end_ms: i64, window_ms: i64) -> i64 {
+        self.window_cut(audio_end_ms, window_ms)
+            .map_or(self.fixed_until_ms, |cut| cut.at_ms)
+    }
+
+    fn window_cut(&self, audio_end_ms: i64, window_ms: i64) -> Option<Cut> {
         if audio_end_ms - self.fixed_until_ms <= window_ms {
-            return self.fixed_until_ms;
+            return None;
         }
         let target = audio_end_ms - window_ms * 2 / 3;
         let earliest = audio_end_ms - window_ms * 5 / 6;
@@ -128,19 +140,20 @@ impl Draft {
             .collect();
         let in_range = cuts.iter().filter(|c| c.at_ms >= earliest);
         let longest = in_range.clone().max_by_key(|c| (c.gap_ms, c.at_ms));
-        let cut = match longest {
-            Some(c) if c.gap_ms >= MIN_PAUSE_MS => Some(c),
+        match longest {
+            Some(c) if c.gap_ms >= MIN_PAUSE_MS => Some(*c),
             _ => in_range
                 .min_by_key(|c| (c.at_ms - target).abs())
-                // No position in the range (the last Recast is far behind): move as far as possible.
-                .or_else(|| cuts.iter().max_by_key(|c| c.at_ms)),
-        };
-        if let Some(cut) = cut {
-            self.fixed
-                .extend(self.checked.drain(..cut.fix).map(|w| w.text));
-            self.fixed_until_ms = cut.at_ms;
+                // If the last Recast is far behind, move as far as possible.
+                .or_else(|| cuts.iter().max_by_key(|c| c.at_ms))
+                .copied(),
         }
-        self.fixed_until_ms
+    }
+
+    fn fix_through(&mut self, cut: Cut) {
+        self.fixed
+            .extend(self.checked.drain(..cut.fix).map(|w| w.text));
+        self.fixed_until_ms = cut.at_ms;
     }
 
     /// All positions where the boundary can go, each as near to `target` as its gap permits.
@@ -160,7 +173,9 @@ impl Draft {
         // The silence before the first checked word. A long pause must not stay in the window.
         let mut last_end = self.fixed_until_ms;
         for (i, word) in self.checked.iter().enumerate() {
-            cuts.push(cut(last_end, word.t0_ms, i));
+            if i == 0 || !is_number(&self.checked[i - 1].text) || !is_number(&word.text) {
+                cuts.push(cut(last_end, word.t0_ms, i));
+            }
             last_end = word.t1_ms;
         }
         // The silence after the last checked word, up to near the end of the last Recast.
@@ -204,6 +219,50 @@ impl Draft {
         self.checked = after_boundary(words, boundary_ms);
         self.checked_until_ms = end_ms;
         true
+    }
+
+    /// Commit a final Recast only if it contains speech after the planned cut.
+    /// Until then, leave the current Draft available for deadline and decode fallbacks.
+    pub fn accept_final_recast(
+        &mut self,
+        boundary_ms: i64,
+        end_ms: i64,
+        window_ms: i64,
+        words: Vec<TimedWord>,
+    ) -> bool {
+        let cut = self.window_cut(end_ms, window_ms);
+        if boundary_ms != cut.map_or(self.fixed_until_ms, |cut| cut.at_ms) {
+            return false;
+        }
+        let words: Vec<_> = after_boundary(words, boundary_ms)
+            .into_iter()
+            .filter(|word| (word.t0_ms + word.t1_ms) / 2 <= end_ms)
+            .collect();
+        if !words.iter().any(|word| has_words(&word.text)) {
+            return false;
+        }
+        if let Some(cut) = cut {
+            self.fix_through(cut);
+        }
+        self.apply_last_recast(boundary_ms, end_ms, words)
+    }
+
+    pub fn unusable_recast_fallback(&self, end_ms: i64, window_ms: i64) -> String {
+        let keep = self.window_cut(end_ms, window_ms).map_or(0, |cut| cut.fix);
+        let view = self.view();
+        if self.checked[keep..]
+            .iter()
+            .any(|word| has_words(&word.text))
+            || has_words(&view.unchecked)
+        {
+            return view.full();
+        }
+        self.fixed
+            .iter()
+            .map(String::as_str)
+            .chain(self.checked[..keep].iter().map(|word| word.text.as_str()))
+            .collect::<Vec<_>>()
+            .join(" ")
     }
 
     /// Where the checked words of a Recast up to `end_ms` end: after the last word that ends
@@ -326,6 +385,11 @@ impl Draft {
             .collect::<Vec<_>>()
             .join(" ")
     }
+}
+
+/// Whether text has any letters or digits to distinguish it from punctuation-only output.
+pub fn has_words(text: &str) -> bool {
+    text.chars().any(char::is_alphanumeric)
 }
 
 /// The words of a Recast whose middle is at or after the boundary.
@@ -487,6 +551,74 @@ mod tests {
         d.set_live_text("hello there", 500);
         assert_eq!(d.view(), view("", "hello there"));
         assert_eq!(d.view().full(), "hello there");
+    }
+
+    #[test]
+    fn unusable_final_preserves_a_word_in_the_live_tail() {
+        let mut d = Draft::default();
+        d.set_live_text("Friday", 1100);
+        for output in [vec![], words(&[("…", 900, 1000)])] {
+            assert!(!d.accept_final_recast(0, 1500, 15_000, output));
+            assert_eq!(d.unusable_recast_fallback(1500, 15_000), "Friday");
+        }
+        assert!(d.accept_final_recast(0, 1500, 15_000, words(&[("Friday.", 900, 1000)])));
+        assert_eq!(d.final_text(), "Friday.");
+    }
+
+    #[test]
+    fn punctuation_only_final_keeps_prefix_without_committing_the_new_cut() {
+        let mut d = Draft::default();
+        d.apply_last_recast(
+            0,
+            19_500,
+            words(&[("Friday.", 0, 8000), ("…", 14_500, 14_600)]),
+        );
+        let original = d.view();
+        let boundary = d.planned_window_start(20_000, 15_000);
+        assert!(boundary > 0);
+        assert!(!d.accept_final_recast(
+            boundary,
+            20_000,
+            15_000,
+            words(&[("Friday.", 8000, 8200), ("…", 14_500, 14_600)])
+        ));
+        assert_eq!(d.view(), original);
+        assert_eq!(d.unusable_recast_fallback(20_000, 15_000), "Friday.");
+        assert!(d.accept_final_recast(
+            boundary,
+            20_000,
+            15_000,
+            words(&[("Yes.", 18_000, 19_000)])
+        ));
+        assert_eq!(d.final_text(), "Friday. Yes.");
+    }
+
+    #[test]
+    fn rolling_boundary_keeps_a_compound_number_together() {
+        let mut d = Draft::default();
+        d.apply_last_recast(
+            0,
+            19_500,
+            words(&[
+                ("at", 0, 9900),
+                ("nine", 9900, 10_000),
+                ("thirty", 10_000, 10_100),
+                ("today", 10_100, 18_000),
+            ]),
+        );
+        let boundary = d.planned_window_start(20_000, 15_000);
+        assert_ne!(boundary, 10_000);
+        assert!(d.accept_final_recast(
+            boundary,
+            20_000,
+            15_000,
+            words(&[
+                ("at", 0, 9900),
+                ("9:30", 9900, 10_100),
+                ("today.", 10_100, 18_000)
+            ])
+        ));
+        assert_eq!(d.final_text(), "at 9:30 today.");
     }
 
     #[test]
