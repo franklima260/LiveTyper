@@ -490,3 +490,5 @@ fn missing_models_give_an_error_that_names_the_folder() {
 
 #[cfg(windows)]
 mod live_writing;
+
+mod recast_replay;

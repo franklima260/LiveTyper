@@ -6,6 +6,19 @@
 
 use std::time::Duration;
 
+use crate::draft::{DraftView, has_words};
+
+/// A completed engine selection is authoritative, including an empty result.
+/// Without one, the insertion deadline uses the latest draft with words.
+pub fn insertion_text(final_text: Option<String>, draft: &DraftView) -> String {
+    let text = final_text.unwrap_or_else(|| draft.full());
+    if has_words(&text) {
+        text
+    } else {
+        String::new()
+    }
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum State {
     Idle,
@@ -153,6 +166,62 @@ mod tests {
 
     fn machine() -> Dictation {
         Dictation::new(Duration::from_millis(300))
+    }
+
+    #[test]
+    fn deadline_fallback_requires_words_and_empty_final_is_authoritative() {
+        let draft = DraftView {
+            checked: "Friday".into(),
+            unchecked: String::new(),
+        };
+        assert_eq!(insertion_text(None, &draft), "Friday");
+        assert_eq!(insertion_text(Some(String::new()), &draft), "");
+        let punctuation = DraftView {
+            checked: "…".into(),
+            unchecked: String::new(),
+        };
+        assert_eq!(insertion_text(None, &punctuation), "");
+    }
+
+    #[test]
+    fn fallback_preserves_the_numbers_in_the_draft() {
+        for text in [
+            "The meeting starts at 9.30 and ends at 1145.",
+            "It starts at 9 30 and ends at 1145.",
+            "It starts at 9:30 and ends at 1199.",
+            "The meeting starts at 9:30 and ends at 11:45.",
+            "Enter code 1145.",
+        ] {
+            let draft = DraftView {
+                checked: text.into(),
+                unchecked: String::new(),
+            };
+            assert_eq!(insertion_text(None, &draft), text);
+            assert_eq!(insertion_text(Some(text.into()), &draft), text);
+        }
+    }
+
+    #[test]
+    fn fallback_preserves_numeric_range_endpoints() {
+        let text = "The pressure range starts at 9.30 and ends at 1145.";
+        let draft = DraftView {
+            checked: String::new(),
+            unchecked: text.to_owned(),
+        };
+        assert_eq!(insertion_text(None, &draft), text);
+    }
+
+    #[test]
+    fn deadline_and_late_final_can_only_select_once() {
+        let mut d = Dictation::new(Duration::ZERO);
+        d.handle(Event::TalkKeyDown);
+        d.handle(Event::TalkKeyUp {
+            held: Duration::ZERO,
+        });
+        assert_eq!(d.handle(Event::DraftFinal), Action::Paste);
+        assert_eq!(d.handle(Event::DraftFinal), Action::None);
+        d.handle(Event::PasteDone);
+        assert_eq!(d.handle(Event::DraftFinal), Action::None);
     }
 
     #[test]

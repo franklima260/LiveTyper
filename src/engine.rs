@@ -6,17 +6,17 @@
 use std::collections::VecDeque;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
-use std::sync::mpsc::{self, Receiver, RecvTimeoutError, Sender, TryRecvError};
+use std::sync::mpsc::{self, Receiver, Sender, TryRecvError};
 use std::thread;
 use std::time::{Duration, Instant};
 
 use transcribe_cpp::{
-    Model, ParakeetStreamOptions, RunOptions, Session, SessionOptions, StreamExtension,
-    StreamOptions, TimestampKind,
+    CancelToken, Model, ParakeetStreamOptions, RunOptions, Session, SessionOptions,
+    StreamExtension, StreamOptions, TimestampKind,
 };
 
 use crate::audio::{AudioBuffer, SAMPLE_RATE};
-use crate::draft::{Draft, DraftView, TimedWord};
+use crate::draft::{Draft, DraftView, TimedWord, has_words};
 
 pub const LIVE_MODEL: &str = "nemotron-speech-streaming-en-0.6b-Q8_0.gguf";
 pub const RECAST_MODEL: &str = "parakeet-tdt-0.6b-v3-Q8_0.gguf";
@@ -25,6 +25,8 @@ pub const RECAST_MODEL: &str = "parakeet-tdt-0.6b-v3-Q8_0.gguf";
 const CHUNK: usize = SAMPLE_RATE / 10;
 /// A Recast needs at least this much audio after the fixed boundary.
 const MIN_RECAST_SAMPLES: usize = SAMPLE_RATE / 4;
+/// Preview work starts once there is enough audio for useful checked text.
+const MIN_PREVIEW_SAMPLES: usize = SAMPLE_RATE * 3 / 2;
 /// Each Recast also decodes this much audio before the fixed boundary, so that the first words
 /// after the boundary have left context. The words in the context are not used.
 const RECAST_CONTEXT_MS: i64 = 2000;
@@ -54,6 +56,31 @@ pub struct Stats {
     pub recasts: u32,
     pub recast_total_ms: u128,
     pub final_recast_ms: Option<u128>,
+    /// Time from requesting preview cancellation until the final worker starts.
+    pub preview_cancel_ms: Option<u128>,
+    pub final_selection: FinalSelection,
+}
+
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub enum FinalSelection {
+    Recast,
+    #[default]
+    DraftNoJob,
+    DraftDecodeFailed,
+    DraftUnusable,
+    Empty,
+}
+
+impl FinalSelection {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Recast => "recast",
+            Self::DraftNoJob => "draft-no-job",
+            Self::DraftDecodeFailed => "draft-decode-failed",
+            Self::DraftUnusable => "draft-unusable-recast",
+            Self::Empty => "empty",
+        }
+    }
 }
 
 pub enum EngineEvent {
@@ -95,35 +122,56 @@ enum Command {
 }
 
 pub struct Engine {
-    commands: Sender<Command>,
+    commands: Option<Sender<Command>>,
+    worker: Option<thread::JoinHandle<()>>,
 }
 
 impl Engine {
     pub fn new(config: EngineConfig, emit: impl Fn(EngineEvent) + Send + 'static) -> Engine {
         let (commands, receiver) = mpsc::channel();
-        thread::Builder::new()
+        let worker = thread::Builder::new()
             .name("engine".into())
             .spawn(move || run(&config, &receiver, &emit))
             .expect("spawn engine thread");
-        Engine { commands }
+        Engine {
+            commands: Some(commands),
+            worker: Some(worker),
+        }
+    }
+
+    fn send(&self, command: Command) {
+        let _ = self
+            .commands
+            .as_ref()
+            .expect("engine is running")
+            .send(command);
     }
 
     pub fn start(&self, generation: u64, audio: Arc<AudioBuffer>) {
-        let _ = self.commands.send(Command::Start { generation, audio });
+        self.send(Command::Start { generation, audio });
     }
 
     /// The Talk Key is up: finish the live decode and run the last Recast.
     pub fn stop(&self, generation: u64) {
-        let _ = self.commands.send(Command::Stop { generation });
+        self.send(Command::Stop { generation });
     }
 
     pub fn cancel(&self, generation: u64) {
-        let _ = self.commands.send(Command::Cancel { generation });
+        self.send(Command::Cancel { generation });
     }
 
     /// Frees the models. The next Dictation loads them again.
     pub fn unload(&self) {
-        let _ = self.commands.send(Command::Unload);
+        self.send(Command::Unload);
+    }
+}
+
+impl Drop for Engine {
+    fn drop(&mut self) {
+        drop(self.commands.take());
+        if let Some(worker) = self.worker.take() {
+            let _ = worker.join();
+        }
     }
 }
 
@@ -153,6 +201,9 @@ fn thread_counts(config: &EngineConfig) -> (i32, i32) {
 
 struct RecastJob {
     generation: u64,
+    id: u64,
+    cancel: CancelToken,
+    preview_cancelled_at: Option<Instant>,
     /// The fixed boundary of the Draft when the job started.
     boundary_ms: i64,
     /// The start of `pcm`: the boundary minus the context.
@@ -165,6 +216,8 @@ struct RecastJob {
 
 struct RecastResult {
     generation: u64,
+    id: u64,
+    preview_cancel_ms: Option<u128>,
     boundary_ms: i64,
     end_ms: i64,
     last: bool,
@@ -173,10 +226,42 @@ struct RecastResult {
     took_ms: u128,
 }
 
+impl RecastResult {
+    fn is_for(&self, generation: u64, active: Option<&ActiveRecast>) -> bool {
+        self.generation == generation && active.is_some_and(|job| job.id == self.id)
+    }
+
+    fn is_fallback_preview(&self, generation: u64, preview_id: Option<u64>) -> bool {
+        self.generation == generation && !self.last && preview_id == Some(self.id)
+    }
+}
+
+struct ActiveRecast {
+    id: u64,
+    cancel: CancelToken,
+}
+
+impl Drop for ActiveRecast {
+    fn drop(&mut self) {
+        self.cancel.cancel();
+    }
+}
+
 struct Models {
     live: Session,
-    jobs: Sender<RecastJob>,
+    jobs: Option<Sender<RecastJob>>,
     results: Receiver<RecastResult>,
+    worker: Option<thread::JoinHandle<()>>,
+}
+
+impl Drop for Models {
+    fn drop(&mut self) {
+        // End the worker before the live session releases the GPU backend.
+        drop(self.jobs.take());
+        if let Some(worker) = self.worker.take() {
+            let _ = worker.join();
+        }
+    }
 }
 
 impl Models {
@@ -208,14 +293,15 @@ impl Models {
 
         let (jobs, job_receiver) = mpsc::channel();
         let (result_sender, results) = mpsc::channel();
-        thread::Builder::new()
+        let worker = thread::Builder::new()
             .name("recast".into())
             .spawn(move || recast_worker(recast, &job_receiver, &result_sender))
             .map_err(|e| e.to_string())?;
         Ok(Models {
             live,
-            jobs,
+            jobs: Some(jobs),
             results,
+            worker: Some(worker),
         })
     }
 }
@@ -228,7 +314,27 @@ fn recast_worker(mut session: Session, jobs: &Receiver<RecastJob>, results: &Sen
     };
     while let Ok(job) = jobs.recv() {
         let started = Instant::now();
-        let words = match session.run(&job.pcm, &options) {
+        if job.cancel.is_cancelled() {
+            continue;
+        }
+        let preview_cancel_ms = job
+            .preview_cancelled_at
+            .map(|at| (started - at).as_millis());
+        if let Some(wait_ms) = preview_cancel_ms {
+            log::info!("final recast worker started {wait_ms} ms after preview cancellation");
+        }
+        session.set_cancel_token(&job.cancel);
+        let decoded = session.run(&job.pcm, &options);
+        session.clear_cancel_token();
+        if job.cancel.is_cancelled() && (job.last || decoded.is_err()) {
+            continue;
+        }
+        #[cfg(test)]
+        let forced_error = job.last && std::env::var_os("LIVETYPER_REPLAY_FORCE_ERROR").is_some();
+        #[cfg(not(test))]
+        let forced_error = false;
+        let words = match decoded {
+            Ok(_) if forced_error => None,
             Ok(transcript) => Some(
                 transcript
                     .words
@@ -248,6 +354,8 @@ fn recast_worker(mut session: Session, jobs: &Receiver<RecastJob>, results: &Sen
         };
         let result = RecastResult {
             generation: job.generation,
+            id: job.id,
+            preview_cancel_ms,
             boundary_ms: job.boundary_ms,
             end_ms: job.end_ms,
             last: job.last,
@@ -312,6 +420,7 @@ fn run(config: &EngineConfig, commands: &Receiver<Command>, emit: &dyn Fn(Engine
                         ..Default::default()
                     },
                     started: Instant::now(),
+                    next_job_id: 0,
                 };
                 session.run(models);
             }
@@ -329,14 +438,6 @@ enum Poll {
     End,
 }
 
-/// The end of the wait for a Recast.
-enum Wait {
-    /// The Recast is done. True if its words are now in the Draft.
-    Done(bool),
-    /// End the Dictation now and send no more events for it.
-    End,
-}
-
 struct Dictation<'a> {
     config: &'a EngineConfig,
     generation: u64,
@@ -348,6 +449,7 @@ struct Dictation<'a> {
     last_view: DraftView,
     stats: Stats,
     started: Instant,
+    next_job_id: u64,
 }
 
 impl Dictation<'_> {
@@ -356,7 +458,9 @@ impl Dictation<'_> {
             live,
             jobs,
             results,
+            ..
         } = models;
+        let jobs = jobs.as_ref().expect("Recast worker is running");
 
         let stream_options = StreamOptions {
             family: Some(StreamExtension::ParakeetStream(ParakeetStreamOptions {
@@ -372,10 +476,14 @@ impl Dictation<'_> {
             }
         };
 
-        let mut fed = 0usize;
-        let mut recast_running = false;
-        let mut last_recast = Instant::now();
+        let mut fed = 0;
+        let mut active: Option<ActiveRecast> = None;
+        let mut fallback_preview_id = None;
+        let mut final_draft = None;
+        let mut next_preview = Instant::now() + self.config.recast_interval;
         let mut stopping = false;
+        let mut finishing = false;
+        let mut live_finished = false;
 
         loop {
             match self.poll() {
@@ -384,24 +492,95 @@ impl Dictation<'_> {
                 Poll::End => return,
             }
 
-            let mut busy = false;
-            // Read `closed` first: if the last push and the close come between the two reads,
-            // `available` then has all of the samples.
+            // Consume a ready preview before observing capture closure.
+            loop {
+                match results.try_recv() {
+                    Ok(result) if result.is_for(self.generation, active.as_ref()) => {
+                        active = None;
+                        if result.last {
+                            let fallback_draft = final_draft
+                                .take()
+                                .map(|draft| std::mem::replace(&mut self.draft, draft));
+                            if self.apply_final(result) {
+                                self.finish(self.draft.final_text(), FinalSelection::Recast);
+                                return;
+                            }
+                            if let Some(draft) = fallback_draft {
+                                self.draft = draft;
+                            }
+                        } else {
+                            // A running Parakeet preview can hold the worker until decode
+                            // returns. Leave the worker idle for twice the decode time,
+                            // with a cap so checked text continues to refresh under load.
+                            let decode =
+                                Duration::from_millis(result.took_ms.min(u64::MAX as u128) as u64);
+                            next_preview = next_preview.max(
+                                Instant::now() + (decode * 2).min(self.config.recast_interval * 4),
+                            );
+                            self.apply_preview(result);
+                        }
+                    }
+                    Ok(result)
+                        if result.is_fallback_preview(self.generation, fallback_preview_id) =>
+                    {
+                        fallback_preview_id = None;
+                        // The final job already has its planned cut. A successful preview that
+                        // finished despite cancellation can still improve the deadline draft.
+                        if let Some(words) = result.words
+                            && let Some(before_preview) = self.draft.apply_fallback_preview(
+                                result.boundary_ms,
+                                result.end_ms,
+                                words,
+                            )
+                        {
+                            final_draft = Some(before_preview);
+                            self.stats.recasts += 1;
+                            self.stats.recast_total_ms += result.took_ms;
+                            self.publish();
+                        }
+                    }
+                    Ok(_) => {}
+                    Err(TryRecvError::Disconnected) => {
+                        if active.take().is_some() && finishing {
+                            self.stats.final_selection = FinalSelection::DraftDecodeFailed;
+                        }
+                        break;
+                    }
+                    Err(TryRecvError::Empty) => break,
+                }
+            }
+
+            // Read closure before the length so the final snapshot includes the last push.
             let closed = self.audio.is_closed();
             let available = self.audio.len();
-            while available - fed >= CHUNK || (closed && fed < available) {
+            if stopping && closed && !finishing {
+                finishing = true;
+                let cancelled_at = active.as_ref().map(|_| Instant::now());
+                fallback_preview_id = active.as_ref().map(|job| job.id);
+                drop(active.take());
+                active = self.send_job(jobs, available, true, cancelled_at);
+            } else if !closed
+                && !stopping
+                && active.is_none()
+                && Instant::now() >= next_preview
+                && available >= MIN_PREVIEW_SAMPLES
+            {
+                active = self.send_job(jobs, available, false, None);
+                next_preview = Instant::now() + self.config.recast_interval;
+            }
+
+            // Work in single chunks so release/closure can overtake a backlog of live audio.
+            if available - fed >= CHUNK || (closed && fed < available) {
                 let end = (fed + CHUNK).min(available);
-                let chunk = self.audio.copy_range(fed, end);
-                fed = end;
-                busy = true;
                 if let Some(s) = stream.as_mut() {
+                    let chunk = self.audio.copy_range(fed, end);
                     match s.feed(&chunk) {
                         Ok(update) if update.committed_changed || update.tentative_changed => {
-                            let at_ms = ms(fed) - self.config.lookahead_ms as i64;
+                            let at_ms = ms(end) - self.config.lookahead_ms as i64;
                             self.draft.set_live_text(&s.text().display(), at_ms.max(0));
                             if self.stats.first_text_ms.is_none() {
                                 self.stats.first_text_ms = Some(self.started.elapsed().as_millis());
-                                self.stats.first_text_audio_ms = Some(ms(fed));
+                                self.stats.first_text_audio_ms = Some(ms(end));
                             }
                             self.publish();
                         }
@@ -412,69 +591,52 @@ impl Dictation<'_> {
                         }
                     }
                 }
+                fed = end;
+                continue;
             }
 
-            while let Ok(result) = results.try_recv() {
-                // A result of a cancelled Dictation can still come; it is ignored.
-                if result.generation == self.generation {
-                    recast_running = false;
-                    busy = true;
-                    self.apply(result);
+            if finishing && !live_finished {
+                live_finished = true;
+                if let Some(mut s) = stream.take() {
+                    match s.finalize() {
+                        Ok(_) => {
+                            self.draft.set_live_text(&s.text().display(), ms(fed));
+                            self.publish();
+                        }
+                        Err(e) => log::error!("live stream finalize: {e}"),
+                    }
                 }
+                // Poll once more before selecting a fallback: the final may be ready.
+                continue;
             }
-
-            if !recast_running
-                && !stopping
-                && last_recast.elapsed() >= self.config.recast_interval
-                && self.audio.len() >= MIN_RECAST_SAMPLES
-            {
-                recast_running = self.send_job(jobs, self.audio.len(), false);
-                last_recast = Instant::now();
+            if finishing && active.is_none() {
+                let selection = self.stats.final_selection;
+                let text = if selection == FinalSelection::DraftUnusable {
+                    self.draft
+                        .unusable_recast_fallback(ms(available), self.config.recast_window_ms)
+                } else {
+                    self.draft.view().full()
+                };
+                self.finish(text, selection);
+                return;
             }
-
-            if stopping && closed && fed >= available {
-                break;
-            }
-            if !busy {
-                thread::sleep(IDLE_POLL);
-            }
+            thread::sleep(IDLE_POLL);
         }
+    }
 
-        // The Talk Key is up and all audio is fed.
-        if let Some(s) = stream.as_mut() {
-            match s.finalize() {
-                Ok(_) => {
-                    let at_ms = ms(fed);
-                    self.draft.set_live_text(&s.text().display(), at_ms);
-                    self.publish();
-                }
-                Err(e) => log::error!("live stream finalize: {e}"),
-            }
-        }
-        drop(stream);
-        if recast_running && let Wait::End = self.wait_for_recast(results) {
+    fn finish(&mut self, text: String, selection: FinalSelection) {
+        if let Poll::End = self.poll() {
             return;
         }
-
-        let end = self.audio.len();
-        self.stats.audio_ms = ms(end);
-        self.stats.speech_onset_ms = speech_onset_ms(&self.audio.copy_range(0, end));
-        let started = Instant::now();
-        let text = if self.send_job(jobs, end, true) {
-            match self.wait_for_recast(results) {
-                Wait::Done(true) => {
-                    self.stats.final_recast_ms = Some(started.elapsed().as_millis());
-                    self.draft.final_text()
-                }
-                // The last Recast failed: the live words are still needed.
-                Wait::Done(false) => self.draft.view().full(),
-                Wait::End => return,
-            }
+        let (text, selection) = if has_words(&text) {
+            (text, selection)
         } else {
-            // Too little new audio for a Recast: the Draft is already final.
-            self.draft.view().full()
+            (String::new(), FinalSelection::Empty)
         };
+        self.stats.audio_ms = ms(self.audio.len());
+        self.stats.speech_onset_ms = speech_onset_ms(&self.audio.copy_range(0, self.audio.len()));
         self.stats.final_words = text.split_whitespace().count();
+        self.stats.final_selection = selection;
         (self.emit)(EngineEvent::Final {
             generation: self.generation,
             text,
@@ -513,62 +675,77 @@ impl Dictation<'_> {
         }
     }
 
-    /// Sends a Recast of the audio from the fixed boundary to `end`, with context before the
-    /// boundary. Returns false if there is too little audio after the boundary.
-    fn send_job(&mut self, jobs: &Sender<RecastJob>, end: usize, last: bool) -> bool {
+    /// Sends a Recast of the audio after the fixed boundary, with left context.
+    fn send_job(
+        &mut self,
+        jobs: &Sender<RecastJob>,
+        end: usize,
+        last: bool,
+        preview_cancelled_at: Option<Instant>,
+    ) -> Option<ActiveRecast> {
         let end_ms = ms(end);
-        let boundary_ms = self
-            .draft
-            .next_window_start(end_ms, self.config.recast_window_ms);
+        // Preview planning can advance the fixed boundary. Keep final planning speculative
+        // so a failed or cancelled final Recast cannot change the fallback Draft.
+        let boundary_ms = if last {
+            self.draft
+                .planned_window_start(end_ms, self.config.recast_window_ms)
+        } else {
+            self.draft
+                .next_window_start(end_ms, self.config.recast_window_ms)
+        };
         if end.saturating_sub(samples(boundary_ms)) < MIN_RECAST_SAMPLES {
-            return false;
+            return None;
         }
         let start_ms = (boundary_ms - RECAST_CONTEXT_MS).max(0);
         let pcm = self.audio.copy_range(samples(start_ms), end);
+        self.next_job_id += 1;
+        let id = self.next_job_id;
+        let cancel = CancelToken::new();
         jobs.send(RecastJob {
             generation: self.generation,
+            id,
+            cancel: cancel.clone(),
+            preview_cancelled_at,
             boundary_ms,
             start_ms,
             end_ms,
             last,
             pcm,
         })
-        .is_ok()
+        .ok()?;
+        Some(ActiveRecast { id, cancel })
     }
 
-    /// Waits for the running Recast of this Dictation and applies it. New commands can end the wait.
-    fn wait_for_recast(&mut self, results: &Receiver<RecastResult>) -> Wait {
-        loop {
-            match results.recv_timeout(IDLE_POLL) {
-                Ok(result) if result.generation == self.generation => {
-                    return Wait::Done(self.apply(result));
-                }
-                Ok(_) | Err(RecvTimeoutError::Timeout) => {}
-                Err(RecvTimeoutError::Disconnected) => return Wait::Done(false),
-            }
-            if let Poll::End = self.poll() {
-                return Wait::End;
-            }
+    fn apply_preview(&mut self, result: RecastResult) {
+        self.stats.recasts += 1;
+        self.stats.recast_total_ms += result.took_ms;
+        if let Some(words) = result.words {
+            self.draft
+                .apply_recast(result.boundary_ms, result.end_ms, words);
+            self.publish();
         }
     }
 
-    /// Applies a Recast result. Returns true if its words are now in the Draft.
-    fn apply(&mut self, result: RecastResult) -> bool {
+    fn apply_final(&mut self, result: RecastResult) -> bool {
         self.stats.recasts += 1;
         self.stats.recast_total_ms += result.took_ms;
+        self.stats.final_recast_ms = Some(result.took_ms);
+        self.stats.preview_cancel_ms = result.preview_cancel_ms;
         let Some(words) = result.words else {
-            // A failed Recast changes nothing. The live words stay.
+            self.stats.final_selection = FinalSelection::DraftDecodeFailed;
             return false;
         };
-        let applied = if result.last {
-            self.draft
-                .apply_last_recast(result.boundary_ms, result.end_ms, words)
+        if self.draft.accept_final_recast(
+            result.boundary_ms,
+            result.end_ms,
+            self.config.recast_window_ms,
+            words,
+        ) {
+            true
         } else {
-            self.draft
-                .apply_recast(result.boundary_ms, result.end_ms, words)
-        };
-        self.publish();
-        applied
+            self.stats.final_selection = FinalSelection::DraftUnusable;
+            false
+        }
     }
 
     fn publish(&mut self) {
@@ -612,6 +789,49 @@ fn samples(ms: i64) -> usize {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn late_preview_cannot_match_the_final_or_the_next_dictation() {
+        let preview = ActiveRecast {
+            id: 1,
+            cancel: CancelToken::new(),
+        };
+        let final_job = ActiveRecast {
+            id: 2,
+            cancel: CancelToken::new(),
+        };
+        let result = RecastResult {
+            generation: 4,
+            id: 1,
+            preview_cancel_ms: None,
+            boundary_ms: 0,
+            end_ms: 1000,
+            last: false,
+            words: None,
+            took_ms: 100,
+        };
+        assert!(result.is_for(4, Some(&preview)));
+        let token = preview.cancel.clone();
+        drop(preview);
+        assert!(token.is_cancelled());
+        assert!(!result.is_for(4, Some(&final_job)));
+        assert!(!result.is_for(4, None));
+        assert!(result.is_fallback_preview(4, Some(1)));
+        assert!(!result.is_fallback_preview(4, Some(2)));
+        assert!(!result.is_fallback_preview(5, Some(1)));
+        let next_preview = ActiveRecast {
+            id: 1,
+            cancel: CancelToken::new(),
+        };
+        assert!(!result.is_for(5, Some(&next_preview)));
+        assert!(
+            !RecastResult {
+                last: true,
+                ..result
+            }
+            .is_fallback_preview(4, Some(1))
+        );
+    }
 
     #[test]
     fn speech_onset_is_the_first_loud_part() {

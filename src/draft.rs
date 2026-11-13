@@ -46,13 +46,14 @@ impl DraftView {
     }
 }
 
-#[derive(Debug, Default)]
+#[derive(Debug, Default, Clone)]
 pub struct Draft {
     fixed: Vec<String>,
     fixed_until_ms: i64,
     checked: Vec<TimedWord>,
     checked_until_ms: i64,
     live: Vec<LiveWord>,
+    preview_numbers: Vec<TimedWord>,
 }
 
 /// The live words have only approximate times. To find where the Unchecked Words start, this many
@@ -114,8 +115,20 @@ impl Draft {
     /// fixed. The boundary goes into the longest pause in the permitted range, or else between the
     /// two words nearest the target. It never goes inside a word, and never back.
     pub fn next_window_start(&mut self, audio_end_ms: i64, window_ms: i64) -> i64 {
+        if let Some(cut) = self.window_cut(audio_end_ms, window_ms) {
+            self.fix_through(cut);
+        }
+        self.fixed_until_ms
+    }
+
+    pub fn planned_window_start(&self, audio_end_ms: i64, window_ms: i64) -> i64 {
+        self.window_cut(audio_end_ms, window_ms)
+            .map_or(self.fixed_until_ms, |cut| cut.at_ms)
+    }
+
+    fn window_cut(&self, audio_end_ms: i64, window_ms: i64) -> Option<Cut> {
         if audio_end_ms - self.fixed_until_ms <= window_ms {
-            return self.fixed_until_ms;
+            return None;
         }
         let target = audio_end_ms - window_ms * 2 / 3;
         let earliest = audio_end_ms - window_ms * 5 / 6;
@@ -128,19 +141,20 @@ impl Draft {
             .collect();
         let in_range = cuts.iter().filter(|c| c.at_ms >= earliest);
         let longest = in_range.clone().max_by_key(|c| (c.gap_ms, c.at_ms));
-        let cut = match longest {
-            Some(c) if c.gap_ms >= MIN_PAUSE_MS => Some(c),
+        match longest {
+            Some(c) if c.gap_ms >= MIN_PAUSE_MS => Some(*c),
             _ => in_range
                 .min_by_key(|c| (c.at_ms - target).abs())
-                // No position in the range (the last Recast is far behind): move as far as possible.
-                .or_else(|| cuts.iter().max_by_key(|c| c.at_ms)),
-        };
-        if let Some(cut) = cut {
-            self.fixed
-                .extend(self.checked.drain(..cut.fix).map(|w| w.text));
-            self.fixed_until_ms = cut.at_ms;
+                // If the last Recast is far behind, move as far as possible.
+                .or_else(|| cuts.iter().max_by_key(|c| c.at_ms))
+                .copied(),
         }
-        self.fixed_until_ms
+    }
+
+    fn fix_through(&mut self, cut: Cut) {
+        self.fixed
+            .extend(self.checked.drain(..cut.fix).map(|w| w.text));
+        self.fixed_until_ms = cut.at_ms;
     }
 
     /// All positions where the boundary can go, each as near to `target` as its gap permits.
@@ -160,7 +174,9 @@ impl Draft {
         // The silence before the first checked word. A long pause must not stay in the window.
         let mut last_end = self.fixed_until_ms;
         for (i, word) in self.checked.iter().enumerate() {
-            cuts.push(cut(last_end, word.t0_ms, i));
+            if i == 0 || !is_number(&self.checked[i - 1].text) || !is_number(&word.text) {
+                cuts.push(cut(last_end, word.t0_ms, i));
+            }
             last_end = word.t1_ms;
         }
         // The silence after the last checked word, up to near the end of the last Recast.
@@ -181,12 +197,60 @@ impl Draft {
             return false;
         }
         let mut words = after_boundary(words, boundary_ms);
+        // A preview can hear the format of a number before the settled cut reaches it.
+        // Keep that evidence for matching live words, even if the preview cannot check them yet.
+        self.preview_numbers
+            .retain(|word| word.t1_ms >= boundary_ms);
+        for word in words
+            .iter()
+            .filter(|word| has_numeric_separator(&word.text) && word.t1_ms <= end_ms - 300)
+        {
+            let mut word = word.clone();
+            word.text = word
+                .text
+                .trim_matches(|c: char| !c.is_ascii_digit())
+                .to_owned();
+            self.preview_numbers.retain(|old| {
+                old.text != word.text || old.t1_ms <= word.t0_ms || word.t1_ms <= old.t0_ms
+            });
+            self.preview_numbers.push(word);
+        }
         if let Some(cut) = self.settled_cut(&words, end_ms) {
             words.truncate(cut.fix);
+            // A punctuation-only preview can hide live words by advancing the checked boundary.
+            if !words.is_empty() && !words.iter().any(|word| has_words(&word.text)) {
+                return true;
+            }
             self.checked = keep_shown_forms(&self.checked, words);
             self.checked_until_ms = cut.at_ms;
         }
         true
+    }
+
+    /// A preview arriving during finalization may extend checked coverage, but an earlier
+    /// settled cut could give checked words back to the streaming model just before insertion.
+    pub fn apply_fallback_preview(
+        &mut self,
+        boundary_ms: i64,
+        end_ms: i64,
+        words: Vec<TimedWord>,
+    ) -> Option<Self> {
+        let mut candidate = self.clone();
+        if !candidate.apply_recast(boundary_ms, end_ms, words)
+            || candidate.checked_until_ms < self.checked_until_ms
+            || self.checked.iter().any(|old| {
+                has_numeric_separator(&old.text)
+                    && !candidate.checked.iter().any(|new| {
+                        has_numeric_separator(&new.text)
+                            && new.t0_ms < old.t1_ms
+                            && old.t0_ms < new.t1_ms
+                            && normal_word(&new.text) == normal_word(&old.text)
+                    })
+            })
+        {
+            return None;
+        }
+        Some(std::mem::replace(self, candidate))
     }
 
     /// Applies the words of the last Recast, which has all of the audio up to `end_ms`. All of its
@@ -204,6 +268,50 @@ impl Draft {
         self.checked = after_boundary(words, boundary_ms);
         self.checked_until_ms = end_ms;
         true
+    }
+
+    /// Commit a final Recast only if it contains speech after the planned cut.
+    /// Until then, leave the current Draft available for deadline and decode fallbacks.
+    pub fn accept_final_recast(
+        &mut self,
+        boundary_ms: i64,
+        end_ms: i64,
+        window_ms: i64,
+        words: Vec<TimedWord>,
+    ) -> bool {
+        let cut = self.window_cut(end_ms, window_ms);
+        if boundary_ms != cut.map_or(self.fixed_until_ms, |cut| cut.at_ms) {
+            return false;
+        }
+        let words: Vec<_> = after_boundary(words, boundary_ms)
+            .into_iter()
+            .filter(|word| (word.t0_ms + word.t1_ms) / 2 <= end_ms)
+            .collect();
+        if !words.iter().any(|word| has_words(&word.text)) {
+            return false;
+        }
+        if let Some(cut) = cut {
+            self.fix_through(cut);
+        }
+        self.apply_last_recast(boundary_ms, end_ms, words)
+    }
+
+    pub fn unusable_recast_fallback(&self, end_ms: i64, window_ms: i64) -> String {
+        let keep = self.window_cut(end_ms, window_ms).map_or(0, |cut| cut.fix);
+        let view = self.view();
+        if self.checked[keep..]
+            .iter()
+            .any(|word| has_words(&word.text))
+            || has_words(&view.unchecked)
+        {
+            return view.full();
+        }
+        self.fixed
+            .iter()
+            .map(String::as_str)
+            .chain(self.checked[..keep].iter().map(|word| word.text.as_str()))
+            .collect::<Vec<_>>()
+            .join(" ")
     }
 
     /// Where the checked words of a Recast up to `end_ms` end: after the last word that ends
@@ -259,10 +367,25 @@ impl Draft {
             checked: checked.join(" "),
             unchecked: unchecked
                 .iter()
-                .map(|w| w.text.as_str())
+                .map(|w| self.live_form(w))
                 .collect::<Vec<_>>()
                 .join(" "),
         }
+    }
+
+    fn live_form<'a>(&'a self, word: &'a LiveWord) -> &'a str {
+        if word.text.is_empty() || !word.text.bytes().all(|byte| byte.is_ascii_digit()) {
+            return &word.text;
+        }
+        self.preview_numbers
+            .iter()
+            .rev()
+            .find(|heard| {
+                word.at_ms >= heard.t0_ms - MATCH_WINDOW_MS
+                    && word.at_ms <= heard.t1_ms + MATCH_WINDOW_MS
+                    && normal_word(&heard.text) == word.text
+            })
+            .map_or(word.text.as_str(), |heard| heard.text.as_str())
     }
 
     /// The index of the first Unchecked Word in the live words. The last checked words are matched
@@ -328,6 +451,11 @@ impl Draft {
     }
 }
 
+/// Whether text has any letters or digits to distinguish it from punctuation-only output.
+pub fn has_words(text: &str) -> bool {
+    text.chars().any(char::is_alphanumeric)
+}
+
 /// The words of a Recast whose middle is at or after the boundary.
 fn after_boundary(words: Vec<TimedWord>, boundary_ms: i64) -> Vec<TimedWord> {
     words
@@ -338,8 +466,24 @@ fn after_boundary(words: Vec<TimedWord>, boundary_ms: i64) -> Vec<TimedWord> {
 
 /// Returns the `new` checked words, but where they differ from the `shown` checked words only in
 /// form (case, punctuation, or digits against letters, as "9:30" and "nine thirty"), the shown words
-/// stay. So the Scratch Pad changes a checked word only when a Recast hears a different word.
+/// stay. An explicit separator between digits is retained when either Recast supplied one.
 fn keep_shown_forms(shown: &[TimedWord], new: Vec<TimedWord>) -> Vec<TimedWord> {
+    // Align same-digit forms before matching surrounding words. A change elsewhere in the
+    // sentence can put the number in an unmatched run even when both decodes agree on its value.
+    let mut new = new;
+    for word in &mut new {
+        if is_number(&word.text)
+            && !has_numeric_separator(&word.text)
+            && let Some(previous) = shown.iter().find(|old| {
+                has_numeric_separator(&old.text)
+                    && old.t0_ms < word.t1_ms
+                    && word.t0_ms < old.t1_ms
+                    && normal_word(&old.text) == normal_word(&word.text)
+            })
+        {
+            word.text.clone_from(&previous.text);
+        }
+    }
     let a: Vec<String> = shown.iter().map(|w| normal_word(&w.text)).collect();
     let b: Vec<String> = new.iter().map(|w| normal_word(&w.text)).collect();
     let mut out = Vec::with_capacity(new.len());
@@ -365,14 +509,28 @@ fn keep_shown_forms(shown: &[TimedWord], new: Vec<TimedWord>) -> Vec<TimedWord> 
     let (mut i0, mut j0) = (0, 0);
     for (i, j) in common_words(&a, &b) {
         flush(&mut out, (i0, i), (j0, j));
+        let previous = &shown[i].text;
+        let current = &new[j].text;
+        let text = if !has_numeric_separator(previous) && has_numeric_separator(current) {
+            current
+        } else {
+            previous
+        };
         out.push(TimedWord {
-            text: shown[i].text.clone(),
+            text: text.clone(),
             ..new[j].clone()
         });
         (i0, j0) = (i + 1, j + 1);
     }
     flush(&mut out, (i0, a.len()), (j0, b.len()));
     out
+}
+
+/// A separator between digits carries information that normal_word omits.
+fn has_numeric_separator(text: &str) -> bool {
+    text.as_bytes().windows(3).any(|bytes| {
+        bytes[0].is_ascii_digit() && matches!(bytes[1], b':' | b'.') && bytes[2].is_ascii_digit()
+    })
 }
 
 /// The pairs (i, j) of a longest common subsequence of `a` and `b`, in order. Of two equal
@@ -487,6 +645,126 @@ mod tests {
         d.set_live_text("hello there", 500);
         assert_eq!(d.view(), view("", "hello there"));
         assert_eq!(d.view().full(), "hello there");
+    }
+
+    #[test]
+    fn unusable_final_preserves_a_word_in_the_live_tail() {
+        let mut d = Draft::default();
+        d.set_live_text("Friday", 1100);
+        for output in [vec![], words(&[("…", 900, 1000)])] {
+            assert!(!d.accept_final_recast(0, 1500, 15_000, output));
+            assert_eq!(d.unusable_recast_fallback(1500, 15_000), "Friday");
+        }
+        assert!(d.accept_final_recast(0, 1500, 15_000, words(&[("Friday.", 900, 1000)])));
+        assert_eq!(d.final_text(), "Friday.");
+    }
+
+    #[test]
+    fn punctuation_only_preview_preserves_live_fallback() {
+        let mut d = Draft::default();
+        d.set_live_text("Friday", 1000);
+        d.apply_recast(0, 2500, words(&[("…", 200, 300)]));
+        assert_eq!(d.view().full(), "Friday");
+        assert!(!d.accept_final_recast(0, 2600, 15_000, words(&[("…", 200, 300)])));
+        assert_eq!(d.unusable_recast_fallback(2600, 15_000), "Friday");
+    }
+
+    #[test]
+    fn fallback_keeps_the_numeric_separator_once_a_recast_hears_it() {
+        let mut d = Draft::default();
+        for text in ["1145", "11.45", "1145"] {
+            d.apply_recast(0, 3000, words(&[(text, 700, 1200)]));
+        }
+        d.set_live_text("1145", 1200);
+        d.set_live_text("1145 works", 3000);
+        assert_eq!(d.view().full(), "11.45 works");
+        assert!(!d.accept_final_recast(0, 3000, 15_000, vec![]));
+        assert_eq!(d.unusable_recast_fallback(3000, 15_000), "11.45 works");
+    }
+
+    #[test]
+    fn a_late_preview_cannot_return_checked_words_to_the_live_tail() {
+        let mut d = Draft::default();
+        d.apply_recast(0, 3000, words(&[("11.45", 700, 1200)]));
+        d.set_live_text("1145", 1200);
+        assert!(d.apply_fallback_preview(0, 2000, vec![]).is_none());
+        assert_eq!(d.view().full(), "11.45");
+    }
+
+    #[test]
+    fn a_late_preview_cannot_drop_a_checked_time_at_the_same_cut() {
+        let mut draft = Draft::default();
+        draft.apply_recast(0, 3000, words(&[("11.45", 700, 1200)]));
+        draft.set_live_text("1145", 1200);
+
+        assert!(draft.apply_fallback_preview(0, 3000, vec![]).is_none());
+        assert_eq!(draft.view().full(), "11.45");
+    }
+
+    #[test]
+    fn an_unsettled_preview_supplies_only_matching_number_formatting() {
+        let mut draft = Draft::default();
+        draft.set_live_text("1145", 1200);
+        draft.apply_recast(0, 1800, words(&[("11.45.", 700, 1200)]));
+        assert_eq!(draft.view(), view("", "11.45"));
+        draft.set_live_text("1146", 1300);
+        assert_eq!(draft.view(), view("", "1146"));
+    }
+
+    #[test]
+    fn punctuation_only_final_keeps_prefix_without_committing_the_new_cut() {
+        let mut d = Draft::default();
+        d.apply_last_recast(
+            0,
+            19_500,
+            words(&[("Friday.", 0, 8000), ("…", 14_500, 14_600)]),
+        );
+        let original = d.view();
+        let boundary = d.planned_window_start(20_000, 15_000);
+        assert!(boundary > 0);
+        assert!(!d.accept_final_recast(
+            boundary,
+            20_000,
+            15_000,
+            words(&[("Friday.", 8000, 8200), ("…", 14_500, 14_600)])
+        ));
+        assert_eq!(d.view(), original);
+        assert_eq!(d.unusable_recast_fallback(20_000, 15_000), "Friday.");
+        assert!(d.accept_final_recast(
+            boundary,
+            20_000,
+            15_000,
+            words(&[("Yes.", 18_000, 19_000)])
+        ));
+        assert_eq!(d.final_text(), "Friday. Yes.");
+    }
+
+    #[test]
+    fn rolling_boundary_keeps_a_compound_number_together() {
+        let mut d = Draft::default();
+        d.apply_last_recast(
+            0,
+            19_500,
+            words(&[
+                ("at", 0, 9900),
+                ("nine", 9900, 10_000),
+                ("thirty", 10_000, 10_100),
+                ("today", 10_100, 18_000),
+            ]),
+        );
+        let boundary = d.planned_window_start(20_000, 15_000);
+        assert_ne!(boundary, 10_000);
+        assert!(d.accept_final_recast(
+            boundary,
+            20_000,
+            15_000,
+            words(&[
+                ("at", 0, 9900),
+                ("9:30", 9900, 10_100),
+                ("today.", 10_100, 18_000)
+            ])
+        ));
+        assert_eq!(d.final_text(), "at 9:30 today.");
     }
 
     #[test]

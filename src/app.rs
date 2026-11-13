@@ -25,7 +25,7 @@ use windows::Win32::UI::WindowsAndMessaging::{
 use windows::core::{Result, w};
 
 use crate::audio::{AudioBuffer, Capture, KeepOpen, SAMPLE_RATE};
-use crate::dictation::{Action, Dictation, Event, Next, State};
+use crate::dictation::{Action, Dictation, Event, Next, State, insertion_text};
 use crate::draft::DraftView;
 use crate::engine::{Engine, EngineConfig, EngineEvent, Stats};
 use crate::hotkey::{Hotkeys, KeyEvent};
@@ -130,6 +130,7 @@ struct App {
     models_unloaded: bool,
     /// The Talk Key is up but the models still load: the release deadline starts when they are ready.
     deadline_waits_for_models: bool,
+    deadline: Option<Instant>,
 }
 
 /// Creates the windows and the worker threads, then runs the message loop until Quit.
@@ -244,6 +245,7 @@ pub fn run(settings: Settings, startup_warning: Option<String>) -> Result<()> {
             last_activity: Instant::now(),
             models_unloaded: true,
             deadline_waits_for_models: false,
+            deadline: None,
         })
     });
 
@@ -396,6 +398,9 @@ impl App {
                 }
             }
             UiEvent::Engine(EngineEvent::Draft { generation, view }) => {
+                if self.is_current(generation) && self.expire_deadline() {
+                    return;
+                }
                 if self.is_current(generation) {
                     self.view = view.clone();
                     // While a next Dictation records, the Scratch Pad shows that one.
@@ -409,6 +414,9 @@ impl App {
                 text,
                 stats,
             }) => {
+                if self.is_current(generation) && self.expire_deadline() {
+                    return;
+                }
                 if self.is_current(generation) && self.dictation.state() == State::Finishing {
                     self.final_text = Some(text);
                     self.stats = Some(stats);
@@ -508,7 +516,18 @@ impl App {
                 self.set_icon(IconState::Busy);
             }
             Action::Paste => {
-                let text = self.final_text.take().unwrap_or_else(|| self.view.full());
+                self.engine.cancel(self.generation);
+                let selection = self
+                    .stats
+                    .as_ref()
+                    .map_or("deadline-draft", |s| s.final_selection.as_str());
+                let text = insertion_text(self.final_text.take(), &self.view);
+                log::info!(
+                    "dictation selection: {selection}, {} ms after release, preview cancellation {:?} ms, final decode {:?} ms",
+                    self.released_at.elapsed().as_millis(),
+                    self.stats.as_ref().and_then(|s| s.preview_cancel_ms),
+                    self.stats.as_ref().and_then(|s| s.final_recast_ms)
+                );
                 if self.dictation.next() == Next::None {
                     self.end_dictation();
                     self.pad.hide();
@@ -625,6 +644,7 @@ impl App {
     /// Ends the parts of the Dictation that finishes, but not the next Dictation.
     fn end_finishing(&mut self) {
         self.kill_timer(TIMER_DEADLINE);
+        self.deadline = None;
         self.deadline_waits_for_models = false;
         self.last_activity = Instant::now();
     }
@@ -637,7 +657,11 @@ impl App {
     /// Starts the release deadline, longer by half of `audio` that the engine has not decoded yet.
     fn start_deadline_after(&mut self, audio: Duration) {
         self.deadline_waits_for_models = false;
-        let ms = self.settings.release_deadline_ms + (audio.as_millis() / 2) as u32;
+        let ms = self
+            .settings
+            .release_deadline_ms
+            .saturating_add((audio.as_millis() / 2).min(u32::MAX as u128) as u32);
+        self.deadline = Some(Instant::now() + Duration::from_millis(ms.into()));
         unsafe { SetTimer(Some(self.hwnd), TIMER_DEADLINE, ms, None) };
     }
 
@@ -645,10 +669,23 @@ impl App {
         self.set_escape(false);
         self.kill_timer(TIMER_LEVEL);
         self.kill_timer(TIMER_DEADLINE);
+        self.deadline = None;
         self.deadline_waits_for_models = false;
         self.audio = None;
         self.set_icon(IconState::Idle);
         self.last_activity = Instant::now();
+    }
+
+    fn expire_deadline(&mut self) -> bool {
+        if self.dictation.state() != State::Finishing
+            || !self
+                .deadline
+                .is_some_and(|deadline| Instant::now() >= deadline)
+        {
+            return false;
+        }
+        self.step(Event::DraftFinal);
+        true
     }
 
     fn on_timer(&mut self, id: usize) {
@@ -659,15 +696,7 @@ impl App {
                 }
             }
             TIMER_DEADLINE => {
-                self.kill_timer(TIMER_DEADLINE);
-                if self.dictation.state() == State::Finishing {
-                    log::info!(
-                        "release deadline of {} ms passed: pasting the current Draft",
-                        self.settings.release_deadline_ms
-                    );
-                    self.final_text = None;
-                    self.step(Event::DraftFinal);
-                }
+                self.expire_deadline();
             }
             TIMER_PASTE => {
                 self.kill_timer(TIMER_PASTE);
