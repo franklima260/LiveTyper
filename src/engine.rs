@@ -765,6 +765,11 @@ mod tests {
         assert!(result.is_fallback_preview(4, Some(1)));
         assert!(!result.is_fallback_preview(4, Some(2)));
         assert!(!result.is_fallback_preview(5, Some(1)));
+        let next_preview = ActiveRecast {
+            id: 1,
+            cancel: CancelToken::new(),
+        };
+        assert!(!result.is_for(5, Some(&next_preview)));
         assert!(
             !RecastResult {
                 last: true,
@@ -772,11 +777,6 @@ mod tests {
             }
             .is_fallback_preview(4, Some(1))
         );
-        let next_preview = ActiveRecast {
-            id: 1,
-            cancel: CancelToken::new(),
-        };
-        assert!(!result.is_for(5, Some(&next_preview)));
     }
 
     #[test]
