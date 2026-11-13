@@ -16,6 +16,7 @@ use transcribe_cpp::{
 };
 
 use crate::audio::{AudioBuffer, SAMPLE_RATE};
+use crate::dictation::format_fallback_times;
 use crate::draft::{Draft, DraftView, TimedWord, has_words};
 
 pub const LIVE_MODEL: &str = "nemotron-speech-streaming-en-0.6b-Q8_0.gguf";
@@ -594,6 +595,11 @@ impl Dictation<'_> {
             return;
         }
         let (text, selection) = if has_words(&text) {
+            let text = if selection == FinalSelection::Recast {
+                text
+            } else {
+                format_fallback_times(text)
+            };
             (text, selection)
         } else {
             (String::new(), FinalSelection::Empty)
