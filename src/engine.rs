@@ -25,6 +25,8 @@ pub const RECAST_MODEL: &str = "parakeet-tdt-0.6b-v3-Q8_0.gguf";
 const CHUNK: usize = SAMPLE_RATE / 10;
 /// A Recast needs at least this much audio after the fixed boundary.
 const MIN_RECAST_SAMPLES: usize = SAMPLE_RATE / 4;
+/// Preview work starts once there is enough audio for useful checked text.
+const MIN_PREVIEW_SAMPLES: usize = SAMPLE_RATE * 3 / 2;
 /// Each Recast also decodes this much audio before the fixed boundary, so that the first words
 /// after the boundary have left context. The words in the context are not used.
 const RECAST_CONTEXT_MS: i64 = 2000;
@@ -468,11 +470,13 @@ impl Dictation<'_> {
                             }
                         } else {
                             // A running Parakeet preview can hold the worker until decode
-                            // returns. Leave time for the final pass between slow previews.
+                            // returns. Leave the worker idle for twice the decode time,
+                            // with a cap so checked text continues to refresh under load.
                             let decode =
                                 Duration::from_millis(result.took_ms.min(u64::MAX as u128) as u64);
-                            next_preview = next_preview
-                                .max(Instant::now() + decode.min(self.config.recast_interval * 2));
+                            next_preview = next_preview.max(
+                                Instant::now() + (decode * 2).min(self.config.recast_interval * 4),
+                            );
                             self.apply_preview(result);
                         }
                     }
@@ -519,7 +523,7 @@ impl Dictation<'_> {
                 && !stopping
                 && active.is_none()
                 && Instant::now() >= next_preview
-                && available >= MIN_RECAST_SAMPLES
+                && available >= MIN_PREVIEW_SAMPLES
             {
                 active = self.send_job(jobs, available, false, None);
                 next_preview = Instant::now() + self.config.recast_interval;
