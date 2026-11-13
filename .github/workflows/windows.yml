@@ -37,7 +37,8 @@ jobs:
           cmake -S $source -B "$source/build" "-DCMAKE_INSTALL_PREFIX=$prefix"
           cmake --install "$source/build"
           "CMAKE_PREFIX_PATH=$prefix" >> $env:GITHUB_ENV
-          "CXXFLAGS=/I`"$prefix/include`"" >> $env:GITHUB_ENV
+          $include = (Join-Path $prefix include).Replace('\', '/')
+          "CXXFLAGS=/I`"$include`"" >> $env:GITHUB_ENV
       - run: cargo test --locked --all-targets
         if: matrix.backend == 'vulkan'
       - run: cargo test --locked --all-targets --no-default-features

@@ -109,7 +109,7 @@ The preview sends basic text through ydotool to the currently focused app after 
 
 The default build includes Vulkan. On a compatible GPU and driver the speech runtime can use Vulkan, with CPU available as a fallback. LiveTyper logs the backend selected for each model when it loads. The AVX2 build floor also applies to Vulkan builds.
 
-For a default Windows build, install the Vulkan SDK and make its tools available in the build environment. If your SDK does not include the SPIR-V Headers CMake package, install SPIR-V Headers to a separate prefix, add that prefix to `CMAKE_PREFIX_PATH`, and add its include directory to `CXXFLAGS` (see the Windows workflow). On Linux, install the Vulkan loader and driver for your GPU, Vulkan and SPIR-V development headers, and `glslc`. The built app needs the loader and driver at runtime.
+For a default Windows build, install the Vulkan SDK and put its tools on PATH. Use CMake 3.21 or newer with the Visual Studio generator. If Build Tools supplies an older CMake, install a newer version and put it first on PATH or set `CMAKE` to its full path. If your SDK does not include the SPIR-V Headers CMake package, install SPIR-V Headers to a separate prefix, add that prefix to `CMAKE_PREFIX_PATH`, and add its include directory to `CXXFLAGS` (see the Windows workflow). Use forward slashes in the include path in `CXXFLAGS`. On Linux, install the Vulkan loader and driver for your GPU, Vulkan and SPIR-V development headers, and `glslc`. The built app needs the loader and driver at runtime.
 
 Use `cargo build --release --locked --no-default-features` for a CPU-only binary, for example when building on a machine without the Vulkan development tools. The original CPU-only benchmarks in the research notes are historical.
 
