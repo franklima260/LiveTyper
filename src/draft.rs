@@ -198,6 +198,10 @@ impl Draft {
         let mut words = after_boundary(words, boundary_ms);
         if let Some(cut) = self.settled_cut(&words, end_ms) {
             words.truncate(cut.fix);
+            // A punctuation-only preview can hide live words by advancing the checked boundary.
+            if !words.is_empty() && !words.iter().any(|word| has_words(&word.text)) {
+                return true;
+            }
             self.checked = keep_shown_forms(&self.checked, words);
             self.checked_until_ms = cut.at_ms;
         }
@@ -563,6 +567,16 @@ mod tests {
         }
         assert!(d.accept_final_recast(0, 1500, 15_000, words(&[("Friday.", 900, 1000)])));
         assert_eq!(d.final_text(), "Friday.");
+    }
+
+    #[test]
+    fn punctuation_only_preview_preserves_live_fallback() {
+        let mut d = Draft::default();
+        d.set_live_text("Friday", 1000);
+        d.apply_recast(0, 2500, words(&[("…", 200, 300)]));
+        assert_eq!(d.view().full(), "Friday");
+        assert!(!d.accept_final_recast(0, 2600, 15_000, words(&[("…", 200, 300)])));
+        assert_eq!(d.unusable_recast_fallback(2600, 15_000), "Friday");
     }
 
     #[test]
