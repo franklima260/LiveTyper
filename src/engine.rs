@@ -123,35 +123,56 @@ enum Command {
 }
 
 pub struct Engine {
-    commands: Sender<Command>,
+    commands: Option<Sender<Command>>,
+    worker: Option<thread::JoinHandle<()>>,
 }
 
 impl Engine {
     pub fn new(config: EngineConfig, emit: impl Fn(EngineEvent) + Send + 'static) -> Engine {
         let (commands, receiver) = mpsc::channel();
-        thread::Builder::new()
+        let worker = thread::Builder::new()
             .name("engine".into())
             .spawn(move || run(&config, &receiver, &emit))
             .expect("spawn engine thread");
-        Engine { commands }
+        Engine {
+            commands: Some(commands),
+            worker: Some(worker),
+        }
+    }
+
+    fn send(&self, command: Command) {
+        let _ = self
+            .commands
+            .as_ref()
+            .expect("engine is running")
+            .send(command);
     }
 
     pub fn start(&self, generation: u64, audio: Arc<AudioBuffer>) {
-        let _ = self.commands.send(Command::Start { generation, audio });
+        self.send(Command::Start { generation, audio });
     }
 
     /// The Talk Key is up: finish the live decode and run the last Recast.
     pub fn stop(&self, generation: u64) {
-        let _ = self.commands.send(Command::Stop { generation });
+        self.send(Command::Stop { generation });
     }
 
     pub fn cancel(&self, generation: u64) {
-        let _ = self.commands.send(Command::Cancel { generation });
+        self.send(Command::Cancel { generation });
     }
 
     /// Frees the models. The next Dictation loads them again.
     pub fn unload(&self) {
-        let _ = self.commands.send(Command::Unload);
+        self.send(Command::Unload);
+    }
+}
+
+impl Drop for Engine {
+    fn drop(&mut self) {
+        drop(self.commands.take());
+        if let Some(worker) = self.worker.take() {
+            let _ = worker.join();
+        }
     }
 }
 
@@ -229,8 +250,19 @@ impl Drop for ActiveRecast {
 
 struct Models {
     live: Session,
-    jobs: Sender<RecastJob>,
+    jobs: Option<Sender<RecastJob>>,
     results: Receiver<RecastResult>,
+    worker: Option<thread::JoinHandle<()>>,
+}
+
+impl Drop for Models {
+    fn drop(&mut self) {
+        // End the worker before the live session releases the GPU backend.
+        drop(self.jobs.take());
+        if let Some(worker) = self.worker.take() {
+            let _ = worker.join();
+        }
+    }
 }
 
 impl Models {
@@ -262,14 +294,15 @@ impl Models {
 
         let (jobs, job_receiver) = mpsc::channel();
         let (result_sender, results) = mpsc::channel();
-        thread::Builder::new()
+        let worker = thread::Builder::new()
             .name("recast".into())
             .spawn(move || recast_worker(recast, &job_receiver, &result_sender))
             .map_err(|e| e.to_string())?;
         Ok(Models {
             live,
-            jobs,
+            jobs: Some(jobs),
             results,
+            worker: Some(worker),
         })
     }
 }
@@ -426,7 +459,9 @@ impl Dictation<'_> {
             live,
             jobs,
             results,
+            ..
         } = models;
+        let jobs = jobs.as_ref().expect("Recast worker is running");
 
         let stream_options = StreamOptions {
             family: Some(StreamExtension::ParakeetStream(ParakeetStreamOptions {
