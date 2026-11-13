@@ -47,6 +47,20 @@ use windows::core::w;
 
 #[cfg(windows)]
 fn main() {
+    // The installer sets how LiveTyper starts with Windows: `--startup=registry`,
+    // `--startup=startup_folder` or `--startup=off`. This changes the settings file and exits.
+    if let Some(choice) =
+        std::env::args().find_map(|a| a.strip_prefix("--startup=").map(str::to_owned))
+    {
+        logging::init();
+        std::process::exit(match set_startup(&choice) {
+            Ok(()) => 0,
+            Err(e) => {
+                log::error!("--startup={choice}: {e}");
+                1
+            }
+        });
+    }
     let Some(_instance) = single_instance() else {
         return;
     };
@@ -56,12 +70,34 @@ fn main() {
     log::info!("LiveTyper {} started", env!("CARGO_PKG_VERSION"));
 
     let (settings, warning) = settings::load_or_create();
-    autostart::apply(settings.start_with_windows);
+    if let Err(error) = autostart::apply(settings.start_with_windows, settings.startup_method) {
+        log::error!("autostart: {error}");
+    }
 
     if let Err(e) = app::run(settings, warning) {
         log::error!("app: {e}");
     }
     log::info!("LiveTyper stopped");
+}
+
+#[cfg(windows)]
+fn set_startup(choice: &str) -> Result<(), String> {
+    let values: &[(&str, &str)] = match choice {
+        "registry" => &[
+            ("start_with_windows", "true"),
+            ("startup_method", "\"registry\""),
+        ],
+        "startup_folder" => &[
+            ("start_with_windows", "true"),
+            ("startup_method", "\"startup_folder\""),
+        ],
+        "off" => &[("start_with_windows", "false")],
+        _ => return Err("use registry, startup_folder or off".into()),
+    };
+    let settings = settings::set_values(values)?;
+    autostart::apply(settings.start_with_windows, settings.startup_method)?;
+    log::info!("start with Windows set to {choice}");
+    Ok(())
 }
 
 /// Returns a handle that marks this process as the running LiveTyper, or `None` if one is already running.

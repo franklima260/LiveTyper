@@ -2,3 +2,4 @@
 /target
 /tests/fixtures/tts-*
 /.claude/worktrees/
+/dist

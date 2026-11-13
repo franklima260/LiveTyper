@@ -44,7 +44,14 @@ The tray menu has these items: Paste Last Dictation, Open settings, Open log, Qu
 
 ## Install on a PC
 
-LiveTyper has no installer. The app is one file, `livetyper.exe` (about 4 MB), and it writes its settings file itself on the first start.
+Run `LiveTyper-Setup-<version>.exe` (see [Build the installer](#build-the-installer)). The setup is for the current user only and needs no administrator rights. It:
+
+- installs `livetyper.exe` into `%LOCALAPPDATA%\Programs\LiveTyper` and adds LiveTyper to the Start menu;
+- installs the Microsoft Visual C++ runtime if the PC does not have it (Windows then asks for administrator rights one time);
+- downloads the two speech models (about 1.4 GB) into `%LOCALAPPDATA%\LiveTyper\models`, but only the models that are not already there, and checks their SHA-256 values;
+- has the option "Start LiveTyper when I sign in to Windows", with a shortcut in the Startup folder (selected) or with a value in the registry. If one way does not work on a PC, run the setup again and select the other one, or change `startup_method` in the settings.
+
+Quit LiveTyper before you run setup or uninstall it. To update, run setup again. Setup keeps the models and uses your selected startup option. To remove LiveTyper, use Installed apps (Apps & features) in the Windows Settings. The uninstaller asks if it must also remove the models, the settings and the log.
 
 ### Requirements
 
@@ -52,17 +59,16 @@ LiveTyper has no installer. The app is one file, `livetyper.exe` (about 4 MB), a
 - A CPU with AVX2. The Minimum Device is an x86-64 laptop from 2020 or newer, with 4 CPU cores, 8 GB RAM and integrated graphics only.
 - Approximately 2.3 GB of RAM while the models are in memory.
 - 1.5 GB of disk space for the two models.
-- The [Microsoft Visual C++ Redistributable (x64)](https://aka.ms/vs/17/release/vc_redist.x64.exe). Many PCs already have it.
 
-### Steps
+### Build the installer
 
-1. Get `livetyper.exe`: build it ([Build from source](#build-from-source)), or copy it from a PC that built it (`target\release\livetyper.exe`).
-2. Put it in a folder that is not under a folder named `target`, for example `%LOCALAPPDATA%\Programs\LiveTyper\`. (LiveTyper does not register a build in Cargo's `target` folder to start with Windows.)
-3. Download the models one time (see [Model setup](#model-setup-one-time)). Copy `scripts\download-models.ps1` to the PC for this step, or copy the `models` folder from another PC.
-4. Start `livetyper.exe`. The tray icon shows. With `start_with_windows = true` (the default), LiveTyper starts again when you sign in to Windows.
-5. Use Open settings in the tray menu to change the Talk Key or other settings, then restart LiveTyper (Quit in the tray menu, then start it again).
+Install [Inno Setup 6](https://jrsoftware.org/isinfo.php), and make sure that the app builds (see [Build from source](#build-from-source)). Then run:
 
-To remove LiveTyper: set `start_with_windows = false` and start LiveTyper one time (or delete the `LiveTyper` value in `HKCU\Software\Microsoft\Windows\CurrentVersion\Run`), quit it, and delete the exe and the folders in [Files](#files).
+```
+powershell -ExecutionPolicy Bypass -File scriptsuild-installer.ps1
+```
+
+The script builds the release exe and writes `dist\LiveTyper-Setup-<version>.exe`. The version comes from `Cargo.toml`. The setup includes `vc_redist.x64.exe` from the Visual Studio Build Tools. The setup script is `installer\LiveTyper.iss`. The default package requires the Vulkan loader on the target PC. Add `-CpuOnly` to the build command to make a package that can run without the loader.
 
 ## Build from source
 
@@ -115,7 +121,7 @@ Use `cargo build --release --locked --no-default-features` for a CPU-only binary
 
 ## Model setup (one time)
 
-Run this script one time:
+The setup downloads the models. Without the setup (for example, for a build from source), run this script one time:
 
 ```
 powershell -ExecutionPolicy Bypass -File scripts\download-models.ps1
@@ -157,6 +163,7 @@ A key that is not in the file takes its default value. An unknown key or an inco
 | `live_threads` | `0` | CPU threads for the live model. `0` = automatic. |
 | `recast_threads` | `0` | CPU threads for the Recast model. `0` = automatic. |
 | `start_with_windows` | `true` | Start LiveTyper when you sign in to Windows. |
+| `startup_method` | `"registry"` | How LiveTyper starts with Windows: `"registry"` (a `LiveTyper` value under `HKCU\Software\Microsoft\Windows\CurrentVersion\Run`) or `"startup_folder"` (a `LiveTyper.lnk` shortcut in the Startup folder). LiveTyper keeps the selected way and removes the other one. |
 
 ## Files
 
@@ -165,7 +172,8 @@ A key that is not in the file takes its default value. An unknown key or an inco
 | `%APPDATA%\LiveTyper\settings.toml` | The settings. |
 | `%LOCALAPPDATA%\LiveTyper\livetyper.log` | Errors, events and timings. The log never contains dictated text. At start-up, a log larger than 1 MB moves to `livetyper.old.log`. |
 | `%LOCALAPPDATA%\LiveTyper\models\` | The model files (default folder). |
-| `HKCU\Software\Microsoft\Windows\CurrentVersion\Run` | The `start_with_windows` value. |
+| `HKCU\Software\Microsoft\Windows\CurrentVersion\Run` | The `LiveTyper` value, if `startup_method = "registry"`. |
+| `%APPDATA%\Microsoft\Windows\Start Menu\Programs\Startup\LiveTyper.lnk` | The shortcut, if `startup_method = "startup_folder"`. |
 
 Each Dictation writes one line to the log: the audio length, where the speech starts, where the first word showed, the number of words, the model load time, the Recast times, and the paste result. The lines "pre-roll" and "post-roll" give the audio that a Dictation got from before the push and after the release.
 

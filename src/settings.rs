@@ -30,6 +30,7 @@ pub struct Settings {
     pub live_threads: u32,
     pub recast_threads: u32,
     pub start_with_windows: bool,
+    pub startup_method: StartupMethod,
 }
 
 impl Default for Settings {
@@ -56,6 +57,7 @@ impl Default for Settings {
             live_threads: 0,
             recast_threads: 0,
             start_with_windows: true,
+            startup_method: StartupMethod::Registry,
         }
     }
 }
@@ -71,6 +73,16 @@ pub enum MicrophoneOpen {
     AfterUse,
     /// Only during a Dictation: no audio from before the push.
     Dictation,
+}
+
+/// How LiveTyper starts with Windows (`start_with_windows`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum StartupMethod {
+    /// A value under `HKCU\Software\Microsoft\Windows\CurrentVersion\Run`.
+    Registry,
+    /// A shortcut in the user's Startup folder.
+    StartupFolder,
 }
 
 impl Settings {
@@ -140,6 +152,9 @@ recast_threads = 0
 
 # Start LiveTyper when you sign in to Windows.
 start_with_windows = true
+# How: "registry" (a Run value in the registry) or "startup_folder" (a shortcut in the Startup
+# folder). If one way does not work on a PC, try the other.
+startup_method = "registry"
 "#;
 
 pub fn parse(text: &str) -> Result<Settings, String> {
@@ -161,6 +176,43 @@ pub fn parse(text: &str) -> Result<Settings, String> {
     if settings.recast_window_s < 2 {
         return Err("recast_window_s: must be 2 or more".into());
     }
+    Ok(settings)
+}
+
+#[cfg(any(windows, test))]
+fn with_values(text: &str, values: &[(&str, &str)]) -> Result<String, String> {
+    use toml_edit::{DocumentMut, Item, Value};
+
+    let mut document = text
+        .parse::<DocumentMut>()
+        .map_err(|error| error.to_string())?;
+    for (key, value) in values {
+        let mut value = value.parse::<Value>().map_err(|error| error.to_string())?;
+        if let Some(previous) = document.get_mut(key).and_then(Item::as_value_mut) {
+            *value.decor_mut() = previous.decor().clone();
+            *previous = value;
+        } else {
+            document.insert(key, Item::Value(value));
+        }
+    }
+    Ok(document.to_string())
+}
+
+/// Sets keys in the settings file (see `with_values`). A missing file starts as the template.
+/// The file changes only if the result is valid.
+#[cfg(windows)]
+pub fn set_values(values: &[(&str, &str)]) -> Result<Settings, String> {
+    let path = paths::settings_file();
+    let text = match fs::read_to_string(&path) {
+        Ok(text) => text,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => TEMPLATE.to_owned(),
+        Err(e) => return Err(format!("cannot read {}: {e}", path.display())),
+    };
+    let text = with_values(&text, values)?;
+    let settings = parse(&text)?;
+    fs::create_dir_all(paths::roaming_dir())
+        .and_then(|()| fs::write(&path, text))
+        .map_err(|e| format!("cannot write {}: {e}", path.display()))?;
     Ok(settings)
 }
 
@@ -259,6 +311,72 @@ mod tests {
                 .microphone_open_after_use_min,
             15
         );
+    }
+
+    #[test]
+    fn startup_method_values() {
+        assert_eq!(
+            parse("startup_method = \"startup_folder\"")
+                .unwrap()
+                .startup_method,
+            StartupMethod::StartupFolder
+        );
+        assert!(parse("startup_method = \"task\"").is_err());
+    }
+
+    #[test]
+    fn set_values_changes_lines_and_keeps_comments() {
+        let text = with_values(
+            TEMPLATE,
+            &[
+                ("start_with_windows", "false"),
+                ("startup_method", "\"startup_folder\""),
+            ],
+        )
+        .unwrap();
+        let s = parse(&text).unwrap();
+        assert!(!s.start_with_windows);
+        assert_eq!(s.startup_method, StartupMethod::StartupFolder);
+        assert_eq!(text.lines().count(), TEMPLATE.lines().count());
+        assert!(text.contains("# Start LiveTyper when you sign in to Windows."));
+        // A key that is not in the text is added; a commented key is not changed.
+        let text = with_values(
+            "# talk_key = \"F9\"
+microphone = \"\"
+",
+            &[("talk_key", "\"F9\"")],
+        )
+        .unwrap();
+        assert_eq!(
+            text,
+            "# talk_key = \"F9\"
+microphone = \"\"
+talk_key = \"F9\"
+"
+        );
+        // A key that only starts the same is another key.
+        let text = with_values(
+            "start_with_windows_x = 1
+",
+            &[("start_with_windows", "true")],
+        )
+        .unwrap();
+        assert!(text.ends_with(
+            "start_with_windows = true
+"
+        ));
+    }
+
+    #[test]
+    fn installer_updates_a_quoted_startup_key_and_preserves_comments() {
+        let text =
+            "# Keep this comment\n'start_with_windows' = true # Keep this too\ntalk_key = \"F9\"\n";
+        let updated = with_values(text, &[("start_with_windows", "false")]).unwrap();
+        let settings = parse(&updated).expect("updated settings");
+        assert!(!settings.start_with_windows);
+        assert_eq!(settings.talk_key, "F9");
+        assert!(updated.contains("# Keep this comment"));
+        assert!(updated.contains("# Keep this too"));
     }
 
     #[test]

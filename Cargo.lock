@@ -795,6 +795,7 @@ dependencies = [
  "log",
  "serde",
  "toml",
+ "toml_edit",
  "transcribe-cpp",
  "windows",
  "windows-numerics",
@@ -1348,6 +1349,7 @@ dependencies = [
  "indexmap",
  "toml_datetime",
  "toml_parser",
+ "toml_writer",
  "winnow",
 ]
 
