@@ -1,6 +1,6 @@
 # LiveTyper
 
-LiveTyper is a local Windows app for Dictation. You speak, and it types your words into any text box. It shows each word while you speak.
+LiveTyper is a local dictation app for Windows, with a KDE Wayland preview for Linux. You speak, and it types your words into any text box. It shows each word while you speak.
 
 LiveTyper is 100% local. It makes no network connections while it runs: no cloud speech service, no telemetry and no update checks ([ADR 0001](docs/adr/0001-no-network-at-runtime.md)). The model download is a separate one-time step that you start.
 
@@ -75,7 +75,7 @@ To remove LiveTyper: set `start_with_windows = false` and start LiveTyper one ti
    If another Rust (for example the scoop `rust-gnu` package) is on the PATH, put `%USERPROFILE%\.cargo\bin` first.
 
 2. Install Visual Studio Build Tools 2019 or newer with the "Desktop development with C++" workload. This workload includes CMake.
-3. Make sure that the `CMAKE` path in `.cargo/config.toml` is correct for your PC. Change it if your Build Tools are in a different folder.
+3. Make sure CMake is on PATH in the Visual Studio developer command prompt. If needed, set the `CMAKE` environment variable to the full path to `cmake.exe`.
 4. Build the app from PowerShell or a Command Prompt (not from Git Bash or MSYS2: there, CMake selects the wrong compiler):
 
    ```
@@ -85,6 +85,25 @@ To remove LiveTyper: set `start_with_windows = false` and start LiveTyper one ti
 The app is `target\release\livetyper.exe`. The first build also builds transcribe-cpp. On the dev PC, it takes approximately 1.5 minutes.
 
 `.cargo/config.toml` also sets the CPU floor for the build (AVX2, not the CPUs of the build PC). Thus, the exe also runs on other PCs.
+
+## CachyOS and KDE Wayland preview
+
+LiveTyper uses the same Nemotron and Parakeet models on Windows and Linux. On KDE Wayland the Scratch Pad shows the live draft, checked words, and a segmented microphone peak meter without taking keyboard focus.
+
+1. Install a stable Rust toolchain, CMake, a C/C++ toolchain, pkg-config, ALSA, GTK4, gtk4-layer-shell, and ydotool. The preview targets x86-64 with AVX2 and a Wayland compositor that supports layer shell.
+2. Start a user-accessible `ydotoold` service. The ydotool client uses `YDOTOOL_SOCKET` if set, or its standard session socket. The account also needs read access to the physical keyboard's evdev device. The preview observes the configured Talk Key and Escape without grabbing the device from the desktop.
+3. Download the models and build the app.
+
+   ```sh
+   bash scripts/download-models.sh
+   cargo build --release --locked
+   ```
+
+4. Run `target/release/livetyper` from a terminal. Hold the Talk Key while a text field is focused. If Voxtype is also running, give LiveTyper its own chord, for example `talk_key = "Ctrl+Shift+F9"`, then restart LiveTyper. Use Escape to cancel a recording and Ctrl+C in the launch terminal to exit.
+
+Linux settings are in `${XDG_CONFIG_HOME:-~/.config}/livetyper/settings.toml`. Models and the log are in `${XDG_DATA_HOME:-~/.local/share}/livetyper/`. The Scratch Pad is anchored at the bottom of the screen.
+
+The preview sends basic text through ydotool to the currently focused app after the modifiers are released. Keep focus in the intended text field through insertion. For text the keyboard driver cannot enter or when the driver reports an error, LiveTyper copies the draft through Plasma’s clipboard and prompts you to paste it. Clipboard history can retain that text. Automatic keyboard insertion requires KDE to report the layout as English (US). For other layout names, including translated names, LiveTyper uses the clipboard. The Linux preview runs from the terminal and uses the desktop's shortcut handling alongside its Talk Key.
 
 ## Model setup (one time)
 
@@ -125,7 +144,7 @@ A key that is not in the file takes its default value. An unknown key or an inco
 | `lookahead_ms` | `480` | The lookahead of the live model, in ms. Use `0`, `80`, `480` or `1040`. Less lookahead shows words sooner, but uses more CPU. |
 | `recast_interval_ms` | `500` | The time between two Recasts, in ms. |
 | `recast_window_s` | `15` | The length of the latest audio that each Recast decodes, in s. Minimum `2`. Words before this window do not change again. |
-| `release_deadline_ms` | `2000` | After you release the Talk Key, the maximum time to wait for the last Recast, in ms. Then LiveTyper pastes the current Draft. |
+| `release_deadline_ms` | Windows `2000`, Linux `10000` | After you release the Talk Key, the maximum time to wait for the last Recast, in ms. Then LiveTyper pastes the current Draft. |
 | `min_hold_ms` | `300` | A shorter Talk Key push, in ms, does nothing. |
 | `live_threads` | `0` | CPU threads for the live model. `0` = automatic. |
 | `recast_threads` | `0` | CPU threads for the Recast model. `0` = automatic. |

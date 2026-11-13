@@ -1,4 +1,4 @@
-//! The settings text file (`%APPDATA%\LiveTyper\settings.toml`).
+//! The settings text file, stored in the platform configuration directory.
 //!
 //! A missing key takes its default value, so later versions can add keys without breaking old files.
 //! An unknown key is an error, so that a typo does not silently do nothing.
@@ -47,7 +47,11 @@ impl Default for Settings {
             lookahead_ms: 480,
             recast_interval_ms: 500,
             recast_window_s: 15,
-            release_deadline_ms: 2000,
+            release_deadline_ms: if cfg!(target_os = "linux") {
+                10_000
+            } else {
+                2_000
+            },
             min_hold_ms: 300,
             live_threads: 0,
             recast_threads: 0,
@@ -87,7 +91,7 @@ const TEMPLATE: &str = r#"# LiveTyper settings. Restart LiveTyper after a change
 # A key that is not in this file takes its default value.
 
 # Hold this key combination to dictate. Examples: "Ctrl+Space", "Ctrl+Alt+D", "F9".
-# LiveTyper sees this key before other apps, so an app with the same shortcut does not get it.
+# On Windows the Talk Key is intercepted. On Linux choose a chord that does not conflict.
 talk_key = "Ctrl+Space"
 
 # Scratch Pad position: the center of its bottom edge, in screen pixels.
@@ -96,7 +100,7 @@ talk_key = "Ctrl+Space"
 # scratch_pad_y = 1000
 scratch_pad_width = 640
 
-# Microphone name, as Windows shows it. Empty = the Windows default microphone.
+# Microphone name. Empty uses the default input device.
 microphone = ""
 
 # When the microphone is open. While it is open, LiveTyper keeps the last 3 seconds of audio in
@@ -124,7 +128,8 @@ recast_interval_ms = 500
 recast_window_s = 15
 
 # After you release the Talk Key, wait at most this long (ms) for the last Recast.
-release_deadline_ms = 2000
+# Default: 2000 on Windows, 10000 on Linux.
+# release_deadline_ms = 2000
 
 # A shorter key press (ms) does nothing.
 min_hold_ms = 300
@@ -259,7 +264,7 @@ mod tests {
     #[test]
     fn empty_models_dir_means_the_default_folder() {
         let s = Settings::default();
-        assert!(s.models_dir().ends_with("LiveTyper\\models"));
+        assert_eq!(s.models_dir(), paths::local_dir().join("models"));
         let s = parse("models_dir = 'D:\\models'").unwrap();
         assert_eq!(s.models_dir(), PathBuf::from("D:\\models"));
     }

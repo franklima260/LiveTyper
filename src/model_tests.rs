@@ -53,7 +53,7 @@ fn models_dir_or_skip(test: &str) -> Option<PathBuf> {
         Some(dir)
     } else {
         println!(
-            "SKIP {test}: the models are not in {}. Run scripts\\download-models.ps1.",
+            "SKIP {test}: the models are not in {}. See Model setup in the README.",
             dir.display()
         );
         None
@@ -488,4 +488,5 @@ fn missing_models_give_an_error_that_names_the_folder() {
     }
 }
 
+#[cfg(windows)]
 mod live_writing;

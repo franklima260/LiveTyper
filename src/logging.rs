@@ -7,6 +7,7 @@ use std::io::Write;
 use std::sync::Mutex;
 
 use log::{LevelFilter, Log, Metadata, Record};
+#[cfg(windows)]
 use windows::Win32::System::SystemInformation::GetLocalTime;
 
 use crate::paths;
@@ -24,19 +25,10 @@ impl Log for FileLogger {
     }
 
     fn log(&self, record: &Record) {
-        let t = unsafe { GetLocalTime() };
-        let line = format!(
-            "{:04}-{:02}-{:02} {:02}:{:02}:{:02}.{:03} {:<5} {}\r\n",
-            t.wYear,
-            t.wMonth,
-            t.wDay,
-            t.wHour,
-            t.wMinute,
-            t.wSecond,
-            t.wMilliseconds,
-            record.level(),
-            record.args()
-        );
+        #[cfg(windows)]
+        let line = windows_line(record);
+        #[cfg(target_os = "linux")]
+        let line = linux_line(record);
         if let Ok(mut file) = self.file.lock() {
             let _ = file.write_all(line.as_bytes());
         }
@@ -52,7 +44,38 @@ impl Log for FileLogger {
     }
 }
 
-/// Starts logging to `%LOCALAPPDATA%\LiveTyper\livetyper.log`. If the file cannot open, the app runs without a log.
+#[cfg(windows)]
+fn windows_line(record: &Record) -> String {
+    let t = unsafe { GetLocalTime() };
+    format!(
+        "{:04}-{:02}-{:02} {:02}:{:02}:{:02}.{:03} {:<5} {}\r\n",
+        t.wYear,
+        t.wMonth,
+        t.wDay,
+        t.wHour,
+        t.wMinute,
+        t.wSecond,
+        t.wMilliseconds,
+        record.level(),
+        record.args()
+    )
+}
+
+#[cfg(target_os = "linux")]
+fn linux_line(record: &Record) -> String {
+    let now = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap_or_default();
+    format!(
+        "{}.{:03} {:<5} {}\n",
+        now.as_secs(),
+        now.subsec_millis(),
+        record.level(),
+        record.args()
+    )
+}
+
+/// Starts file logging if the platform log directory is writable.
 pub fn init() {
     let path = paths::log_file();
     let _ = fs::create_dir_all(paths::local_dir());

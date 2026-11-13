@@ -317,6 +317,7 @@ fn stats(v: &mut [f64]) -> String {
     )
 }
 
+#[cfg(windows)]
 fn print_memory(label: &str) {
     use windows_sys::Win32::System::ProcessStatus::{
         K32GetProcessMemoryInfo, PROCESS_MEMORY_COUNTERS,
@@ -330,4 +331,13 @@ fn print_memory(label: &str) {
         c.WorkingSetSize as f64 / 1e6,
         c.PagefileUsage as f64 / 1e6
     );
+}
+
+#[cfg(target_os = "linux")]
+fn print_memory(label: &str) {
+    if let Ok(status) = std::fs::read_to_string("/proc/self/status") {
+        for line in status.lines().filter(|line| line.starts_with("VmRSS:")) {
+            println!("memory {label}: {line}");
+        }
+    }
 }

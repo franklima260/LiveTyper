@@ -24,6 +24,7 @@ use std::time::{Duration, Instant};
 use cpal::traits::{DeviceTrait, HostTrait, StreamTrait};
 use cpal::{FromSample, SampleFormat, SizedSample};
 
+use crate::meter::normalized_peak;
 use crate::resample::Resampler;
 
 pub const SAMPLE_RATE: usize = 16_000;
@@ -32,7 +33,7 @@ pub const SAMPLE_RATE: usize = 16_000;
 #[derive(Default)]
 pub struct AudioBuffer {
     samples: Mutex<Vec<f32>>,
-    /// The latest input level, 0..1, as f32 bits.
+    /// The largest input peak since the last display update, 0..1, as f32 bits.
     level: AtomicU32,
     /// Set when the capture stopped and no more samples come.
     closed: AtomicBool,
@@ -54,15 +55,16 @@ impl AudioBuffer {
     }
 
     pub fn level(&self) -> f32 {
-        f32::from_bits(self.level.load(Ordering::Relaxed))
+        f32::from_bits(self.level.swap(0, Ordering::Relaxed))
     }
 
-    fn set_level(&self, level: f32) {
-        self.level.store(level.to_bits(), Ordering::Relaxed);
+    fn record_peak(&self, level: f32) {
+        // Nonnegative f32 bit patterns sort in the same order as their values.
+        self.level.fetch_max(level.to_bits(), Ordering::Relaxed);
     }
 
     pub fn close(&self) {
-        self.set_level(0.0);
+        self.level.store(0, Ordering::Relaxed);
         self.closed.store(true, Ordering::SeqCst);
     }
 
@@ -136,7 +138,7 @@ impl Shared {
         inner.since_stop = (inner.since_stop + samples.len()).min(RING);
         if let Some(target) = &inner.target {
             target.push(samples);
-            target.set_level(level);
+            target.record_peak(level);
         }
     }
 
@@ -546,7 +548,7 @@ where
             }));
             out.clear();
             resampler.process(&mono, &mut out);
-            shared.push(&out, level(&mono));
+            shared.push(&out, normalized_peak(&mono));
         },
         move |e: cpal::Error| {
             if stream_stopped(e.kind()) {
@@ -572,15 +574,6 @@ fn stream_stopped(kind: cpal::ErrorKind) -> bool {
     )
 }
 
-/// RMS level mapped from -60..0 dBFS to 0..1.
-fn level(samples: &[f32]) -> f32 {
-    if samples.is_empty() {
-        return 0.0;
-    }
-    let rms = (samples.iter().map(|s| s * s).sum::<f32>() / samples.len() as f32).sqrt();
-    ((20.0 * rms.max(1e-9).log10() + 60.0) / 60.0).clamp(0.0, 1.0)
-}
-
 /// Plays a WAV file into the buffer at real-time speed until Stop, then adds silence.
 fn play_test_audio(
     path: &PathBuf,
@@ -602,7 +595,7 @@ fn play_test_audio(
             let piece: Vec<f32> = (position..position + chunk)
                 .map(|i| samples.get(i).copied().unwrap_or(0.0))
                 .collect();
-            buffer.set_level(level(&piece));
+            buffer.record_peak(normalized_peak(&piece));
             buffer.push(&piece);
             position += chunk;
         }
@@ -647,12 +640,24 @@ mod tests {
     use super::*;
 
     #[test]
-    fn level_maps_decibels() {
-        assert_eq!(level(&[]), 0.0);
-        assert_eq!(level(&[0.0; 100]), 0.0);
-        assert!((level(&[1.0; 100]) - 1.0).abs() < 1e-6);
+    fn peak_maps_decibels() {
+        assert_eq!(normalized_peak(&[]), 0.0);
+        assert_eq!(normalized_peak(&[0.0; 100]), 0.0);
+        assert!((normalized_peak(&[1.0; 100]) - 1.0).abs() < 1e-6);
         let minus_30_db = 10f32.powf(-30.0 / 20.0);
-        assert!((level(&[minus_30_db; 100]) - 0.5).abs() < 0.01);
+        assert!((normalized_peak(&[minus_30_db; 100]) - 0.5).abs() < 0.01);
+    }
+
+    #[test]
+    fn meter_keeps_the_highest_peak_between_display_updates() {
+        let audio = AudioBuffer::default();
+        audio.record_peak(0.75);
+        audio.record_peak(0.1);
+        assert_eq!(audio.level(), 0.75);
+        assert_eq!(audio.level(), 0.0);
+        audio.record_peak(1.0);
+        audio.close();
+        assert_eq!(audio.level(), 0.0);
     }
 
     /// Opens the default microphone three times, one after the other, as follow-up Dictations do.
@@ -1055,6 +1060,15 @@ mod tests {
             mic.stop();
             (preroll, ms(buffer.len()))
         }
+        // Drive the same post-roll and idle timers as the capture worker.
+        fn wait_with_ticks(mic: &mut Microphone<'_>, duration: Duration) {
+            let until = Instant::now() + duration;
+            while Instant::now() < until {
+                thread::sleep(POST_ROLL_CHECK);
+                mic.tick();
+            }
+        }
+
         for (name, keep_open) in [
             ("always", KeepOpen::Always),
             ("after_use", KeepOpen::After(Duration::from_secs(1))),
@@ -1065,12 +1079,11 @@ mod tests {
             thread::sleep(Duration::from_millis(1000));
             let first = record(&mut mic);
             println!("{name}: open after a Dictation: {}", mic.stream.is_some());
-            thread::sleep(Duration::from_millis(400));
+            wait_with_ticks(&mut mic, Duration::from_millis(600));
             let second = record(&mut mic);
-            thread::sleep(Duration::from_millis(1300));
-            mic.tick();
+            wait_with_ticks(&mut mic, Duration::from_millis(1500));
             println!(
-                "{name}: Dictations (pre-roll ms, audio ms): {first:?} {second:?}; open 1.3 s \
+                "{name}: Dictations (pre-roll ms, audio ms): {first:?} {second:?}; open 1.5 s \
                  after the last one: {}",
                 mic.stream.is_some()
             );
