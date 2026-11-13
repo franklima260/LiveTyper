@@ -14,7 +14,7 @@ use std::time::{Duration, Instant};
 use gtk4::{gio, glib, prelude::*};
 
 use crate::audio::{AudioBuffer, Capture, KeepOpen, SAMPLE_RATE};
-use crate::dictation::{Action, Dictation, Event, Next, State};
+use crate::dictation::{Action, Dictation, Event, Next, State, insertion_text};
 use crate::draft::DraftView;
 use crate::engine::{Engine, EngineConfig, EngineEvent};
 use crate::hotkey::{Hotkeys, KeyEvent};
@@ -56,6 +56,9 @@ struct App {
     last_activity: Instant,
     models_ready: bool,
     deadline: Option<Instant>,
+    released_at: Instant,
+    next_released_at: Option<Instant>,
+    selection: Option<&'static str>,
     message_until: Option<Instant>,
 }
 
@@ -126,6 +129,9 @@ pub fn run(settings: Settings, warning: Option<String>) -> Result<(), String> {
         last_activity: now,
         models_ready: false,
         deadline: None,
+        released_at: now,
+        next_released_at: None,
+        selection: None,
         message_until: None,
     };
     if let Some(message) = warning {
@@ -161,7 +167,14 @@ impl App {
                     held: at.saturating_duration_since(self.key_down_at),
                 });
             }
-            Message::Key(KeyEvent::Escape, _) => self.step(Event::Escape),
+            Message::Key(KeyEvent::Escape, _) => {
+                if self.dictation.next() == Next::None && self.output.take().is_some() {
+                    self.hotkeys.set_escape(false);
+                    self.step(Event::PasteDone);
+                } else {
+                    self.step(Event::Escape);
+                }
+            }
             Message::Engine(EngineEvent::Ready { generation }) => {
                 if generation != self.generation {
                     return;
@@ -184,6 +197,9 @@ impl App {
                 if generation == self.generation
                     && matches!(self.dictation.state(), State::Recording | State::Finishing) =>
             {
+                if self.expire_deadline() {
+                    return;
+                }
                 self.view = view;
                 if self.dictation.next() == Next::None {
                     self.pad.draft(&self.view);
@@ -194,14 +210,19 @@ impl App {
                 text,
                 stats,
             }) if generation == self.generation && self.dictation.state() == State::Finishing => {
+                if self.expire_deadline() {
+                    return;
+                }
+                self.selection = Some(stats.final_selection.as_str());
                 log::info!(
-                    "dictation: audio {:.1} s, {} words, model load {:?} ms, first text {:?} ms, {} recasts, last recast {:?} ms",
+                    "dictation: audio {:.1} s, {} words, model load {:?} ms, first text {:?} ms, {} recasts, last recast {:?} ms, preview cancellation {:?} ms",
                     stats.audio_ms as f64 / 1000.0,
                     stats.final_words,
                     stats.load_ms,
                     stats.first_text_ms,
                     stats.recasts,
                     stats.final_recast_ms,
+                    stats.preview_cancel_ms,
                 );
                 self.final_text = Some(text);
                 self.step(Event::DraftFinal);
@@ -251,11 +272,18 @@ impl App {
                 self.last_activity = Instant::now();
                 if self.dictation.next() == Next::None {
                     self.audio = None;
-                    self.hotkeys.set_escape(false);
                     self.pad.hide();
                 }
-                let text = self.final_text.take().unwrap_or_else(|| self.view.full());
-                if text.trim().is_empty() {
+                let selection = self.selection.take().unwrap_or("deadline-draft");
+                log::info!(
+                    "dictation selection: {selection}, {} ms after release",
+                    self.released_at.elapsed().as_millis()
+                );
+                let text = insertion_text(self.final_text.take(), &self.view);
+                if text.is_empty() {
+                    if self.dictation.next() == Next::None {
+                        self.hotkeys.set_escape(false);
+                    }
                     self.step(Event::PasteDone);
                 } else {
                     self.output = Some(PendingOutput {
@@ -264,7 +292,10 @@ impl App {
                     });
                 }
             }
-            Action::StartNext => self.start_capture(),
+            Action::StartNext => {
+                self.next_released_at = None;
+                self.start_capture();
+            }
             Action::CancelNext => {
                 self.capture.stop();
                 self.audio = None;
@@ -272,7 +303,7 @@ impl App {
                     self.pad.show(Status::Finishing);
                     self.pad.draft(&self.view);
                 } else {
-                    self.hotkeys.set_escape(false);
+                    self.hotkeys.set_escape(self.output.is_some());
                     self.pad.hide();
                 }
             }
@@ -306,7 +337,9 @@ impl App {
         self.engine.start(self.generation, audio);
         self.view = DraftView::default();
         self.final_text = None;
+        self.selection = None;
         if recorded {
+            self.released_at = self.next_released_at.take().unwrap_or_else(Instant::now);
             self.engine.stop(self.generation);
             if self.models_ready {
                 self.set_deadline(self.audio_duration() / 2);
@@ -318,10 +351,13 @@ impl App {
         self.capture.stop();
         self.pad.status(Status::Finishing);
         if current {
+            self.released_at = Instant::now();
             self.engine.stop(self.generation);
             if self.models_ready {
                 self.set_deadline(Duration::ZERO);
             }
+        } else {
+            self.next_released_at = Some(Instant::now());
         }
     }
 
@@ -372,15 +408,21 @@ impl App {
         }
     }
 
-    fn tick(&mut self) {
-        let now = Instant::now();
-        if self.deadline.is_some_and(|deadline| now >= deadline) {
-            log::info!(
-                "release deadline of {} ms passed: inserting the current Draft",
-                self.settings.release_deadline_ms
-            );
-            self.step(Event::DraftFinal);
+    fn expire_deadline(&mut self) -> bool {
+        if self.dictation.state() != State::Finishing
+            || !self
+                .deadline
+                .is_some_and(|deadline| Instant::now() >= deadline)
+        {
+            return false;
         }
+        self.step(Event::DraftFinal);
+        true
+    }
+
+    fn tick(&mut self) {
+        self.expire_deadline();
+        let now = Instant::now();
         if self.message_until.is_some_and(|deadline| now >= deadline) {
             self.message_until = None;
             self.pad.hide();
@@ -390,6 +432,9 @@ impl App {
         }
         if self.output.is_some() && self.hotkeys.modifiers_released() {
             let pending = self.output.take().unwrap();
+            if self.dictation.next() == Next::None {
+                self.hotkeys.set_escape(false);
+            }
             if pending
                 .text
                 .bytes()
@@ -416,6 +461,9 @@ impl App {
             .is_some_and(|output| now >= output.until)
         {
             let pending = self.output.take().unwrap();
+            if self.dictation.next() == Next::None {
+                self.hotkeys.set_escape(false);
+            }
             self.copy_output(&pending.text);
         }
         if self.dictation.state() == State::Idle
