@@ -42,3 +42,7 @@ jobs:
         if: matrix.backend == 'vulkan'
       - run: cargo test --locked --all-targets --no-default-features
         if: matrix.backend == 'cpu'
+      - run: cargo build --locked
+        if: matrix.backend == 'vulkan'
+      - run: cargo build --locked --no-default-features
+        if: matrix.backend == 'cpu'
