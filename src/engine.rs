@@ -482,8 +482,18 @@ impl Dictation<'_> {
                         fallback_preview_id = None;
                         // The final job already has its planned cut. A successful preview that
                         // finished despite cancellation can still improve the deadline draft.
-                        final_draft = Some(self.draft.clone());
-                        self.apply_preview(result);
+                        if let Some(words) = result.words
+                            && let Some(before_preview) = self.draft.apply_fallback_preview(
+                                result.boundary_ms,
+                                result.end_ms,
+                                words,
+                            )
+                        {
+                            final_draft = Some(before_preview);
+                            self.stats.recasts += 1;
+                            self.stats.recast_total_ms += result.took_ms;
+                            self.publish();
+                        }
                     }
                     Ok(_) => {}
                     Err(TryRecvError::Disconnected) => {

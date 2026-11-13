@@ -208,6 +208,23 @@ impl Draft {
         true
     }
 
+    /// A preview arriving during finalization may extend checked coverage, but an earlier
+    /// settled cut could give checked words back to the streaming model just before insertion.
+    pub fn apply_fallback_preview(
+        &mut self,
+        boundary_ms: i64,
+        end_ms: i64,
+        words: Vec<TimedWord>,
+    ) -> Option<Self> {
+        let mut candidate = self.clone();
+        if !candidate.apply_recast(boundary_ms, end_ms, words)
+            || candidate.checked_until_ms < self.checked_until_ms
+        {
+            return None;
+        }
+        Some(std::mem::replace(self, candidate))
+    }
+
     /// Applies the words of the last Recast, which has all of the audio up to `end_ms`. All of its
     /// words after the boundary become checked, in the form that the Recast gives.
     /// Returns false, and changes nothing, if the boundary is old.
@@ -406,8 +423,24 @@ fn after_boundary(words: Vec<TimedWord>, boundary_ms: i64) -> Vec<TimedWord> {
 
 /// Returns the `new` checked words, but where they differ from the `shown` checked words only in
 /// form (case, punctuation, or digits against letters, as "9:30" and "nine thirty"), the shown words
-/// stay. So the Scratch Pad changes a checked word only when a Recast hears a different word.
+/// stay. An explicit separator between digits is retained when either Recast supplied one.
 fn keep_shown_forms(shown: &[TimedWord], new: Vec<TimedWord>) -> Vec<TimedWord> {
+    // Align same-digit forms before matching surrounding words. A change elsewhere in the
+    // sentence can put the number in an unmatched run even when both decodes agree on its value.
+    let mut new = new;
+    for word in &mut new {
+        if is_number(&word.text)
+            && !has_numeric_separator(&word.text)
+            && let Some(previous) = shown.iter().find(|old| {
+                has_numeric_separator(&old.text)
+                    && old.t0_ms < word.t1_ms
+                    && word.t0_ms < old.t1_ms
+                    && normal_word(&old.text) == normal_word(&word.text)
+            })
+        {
+            word.text.clone_from(&previous.text);
+        }
+    }
     let a: Vec<String> = shown.iter().map(|w| normal_word(&w.text)).collect();
     let b: Vec<String> = new.iter().map(|w| normal_word(&w.text)).collect();
     let mut out = Vec::with_capacity(new.len());
@@ -604,6 +637,15 @@ mod tests {
         assert_eq!(d.view().full(), "11.45 works");
         assert!(!d.accept_final_recast(0, 3000, 15_000, vec![]));
         assert_eq!(d.unusable_recast_fallback(3000, 15_000), "11.45 works");
+    }
+
+    #[test]
+    fn a_late_preview_cannot_return_checked_words_to_the_live_tail() {
+        let mut d = Draft::default();
+        d.apply_recast(0, 3000, words(&[("11.45", 700, 1200)]));
+        d.set_live_text("1145", 1200);
+        assert!(d.apply_fallback_preview(0, 2000, vec![]).is_none());
+        assert_eq!(d.view().full(), "11.45");
     }
 
     #[test]
