@@ -198,6 +198,7 @@ Some of these tests in detail:
   ```
 
 - **Final Recast replay:** compares the draft at release, completed correction, and text that would be selected at the Windows and Linux deadlines. It reports word errors, punctuation, and timings. Generate the WAV fixtures below and use the same files and model checksums for baseline and candidate runs. The replay prints fixture text to the test console.
+  Set `LIVETYPER_REPLAY_FORCE_ERROR=1` in the test environment to discard the final decoder result and exercise the fallback with the same decoding work and captured audio.
 
   ```
   cargo test --locked recast_replay -- --ignored --nocapture

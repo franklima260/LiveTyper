@@ -296,7 +296,12 @@ fn recast_worker(mut session: Session, jobs: &Receiver<RecastJob>, results: &Sen
         if job.cancel.is_cancelled() && (job.last || decoded.is_err()) {
             continue;
         }
+        #[cfg(test)]
+        let forced_error = job.last && std::env::var_os("LIVETYPER_REPLAY_FORCE_ERROR").is_some();
+        #[cfg(not(test))]
+        let forced_error = false;
         let words = match decoded {
+            Ok(_) if forced_error => None,
             Ok(transcript) => Some(
                 transcript
                     .words
