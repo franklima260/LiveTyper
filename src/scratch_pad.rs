@@ -2,7 +2,7 @@
 //!
 //! It never takes the focus and lets mouse clicks pass through (`WS_EX_NOACTIVATE`,
 //! `WS_EX_TRANSPARENT`), so the caret stays in the Target Text Box. It is drawn with Direct2D and
-//! DirectWrite. It starts with one line of text and grows upward to at most 10 lines.
+//! DirectWrite. The pad grows upward as the draft wraps.
 //!
 //! The Direct2D and DirectWrite objects use much memory (Direct2D loads the graphics driver), so
 //! they are made on the first show, and the render target is released when the Scratch Pad hides.
@@ -12,19 +12,20 @@ use windows::Win32::Graphics::Direct2D::Common::{
     D2D_RECT_F, D2D_SIZE_U, D2D1_ALPHA_MODE_PREMULTIPLIED, D2D1_COLOR_F, D2D1_PIXEL_FORMAT,
 };
 use windows::Win32::Graphics::Direct2D::{
-    D2D1_ANTIALIAS_MODE_PER_PRIMITIVE, D2D1_DRAW_TEXT_OPTIONS_NONE, D2D1_ELLIPSE,
+    D2D1_ANTIALIAS_MODE_PER_PRIMITIVE, D2D1_DRAW_TEXT_OPTIONS_NONE,
     D2D1_FACTORY_TYPE_SINGLE_THREADED, D2D1_HWND_RENDER_TARGET_PROPERTIES,
     D2D1_PRESENT_OPTIONS_NONE, D2D1_RENDER_TARGET_PROPERTIES, D2D1_ROUNDED_RECT, D2D1CreateFactory,
     ID2D1Factory, ID2D1HwndRenderTarget, ID2D1RenderTarget, ID2D1SolidColorBrush,
 };
 use windows::Win32::Graphics::DirectWrite::{
     DWRITE_FACTORY_TYPE_SHARED, DWRITE_FONT_STRETCH_NORMAL, DWRITE_FONT_STYLE_NORMAL,
-    DWRITE_FONT_WEIGHT_NORMAL, DWRITE_FONT_WEIGHT_SEMI_BOLD, DWRITE_TEXT_METRICS,
-    DWRITE_TEXT_RANGE, DWRITE_WORD_WRAPPING_NO_WRAP, DWRITE_WORD_WRAPPING_WRAP,
+    DWRITE_FONT_WEIGHT_NORMAL, DWRITE_TEXT_METRICS, DWRITE_TEXT_RANGE, DWRITE_WORD_WRAPPING_WRAP,
     DWriteCreateFactory, IDWriteFactory, IDWriteTextFormat, IDWriteTextLayout,
 };
 use windows::Win32::Graphics::Dxgi::Common::DXGI_FORMAT_B8G8R8A8_UNORM;
-use windows::Win32::Graphics::Gdi::{BeginPaint, EndPaint, PAINTSTRUCT, ValidateRect};
+use windows::Win32::Graphics::Gdi::{
+    BeginPaint, CreateRoundRectRgn, DeleteObject, EndPaint, PAINTSTRUCT, SetWindowRgn, ValidateRect,
+};
 use windows::Win32::System::LibraryLoader::GetModuleHandleW;
 use windows::Win32::UI::HiDpi::GetDpiForWindow;
 use windows::Win32::UI::WindowsAndMessaging::{
@@ -39,18 +40,11 @@ use windows::core::{Error, Interface, Result, w};
 use crate::draft::DraftView;
 use crate::meter::{PeakMeter, SEGMENTS};
 
-// Sizes in DIPs (1/96 inch).
-const PADDING: f32 = 14.0;
-const STATUS_HEIGHT: f32 = 18.0;
-const GAP: f32 = 8.0;
-const TEXT_SIZE: f32 = 18.0;
-const STATUS_SIZE: f32 = 12.5;
-const MAX_LINES: u32 = 10;
-const LEVEL_WIDTH: f32 = 18.0;
-const LEVEL_HEIGHT: f32 = 26.0;
-const CORNER: f32 = 10.0;
-/// Distance from the bottom of the work area when no position is set.
-const DEFAULT_BOTTOM_MARGIN: f32 = 24.0;
+use crate::pad_style::*;
+
+const INSET_X: f32 = (HORIZONTAL_PADDING + BORDER) as f32;
+const INSET_Y: f32 = (VERTICAL_PADDING + BORDER) as f32;
+
 /// Asks for a new WM_PAINT. A WM_PAINT cannot do this itself, because its update region is
 /// validated when it ends.
 const WM_REPAINT: u32 = WM_APP + 1;
@@ -76,23 +70,20 @@ struct Brushes {
     text: ID2D1SolidColorBrush,
     unchecked: ID2D1SolidColorBrush,
     muted: ID2D1SolidColorBrush,
-    recording: ID2D1SolidColorBrush,
-    waiting: ID2D1SolidColorBrush,
+    outline: ID2D1SolidColorBrush,
     meter: ID2D1SolidColorBrush,
 }
 
 impl Brushes {
     fn new(target: &ID2D1RenderTarget) -> Result<Brushes> {
-        let brush =
-            |r: f32, g: f32, b: f32| unsafe { target.CreateSolidColorBrush(&color(r, g, b), None) };
+        let brush = |rgb| unsafe { target.CreateSolidColorBrush(&rgb_color(rgb), None) };
         Ok(Brushes {
-            background: brush(0.12, 0.12, 0.14)?,
-            text: brush(0.95, 0.95, 0.95)?,
-            unchecked: brush(0.55, 0.55, 0.58)?,
-            muted: brush(0.70, 0.70, 0.72)?,
-            recording: brush(0.90, 0.28, 0.30)?,
-            waiting: brush(0.96, 0.65, 0.14)?,
-            meter: brush(0.0, 0.0, 0.0)?,
+            background: brush(BACKGROUND)?,
+            text: brush(CHECKED_TEXT)?,
+            unchecked: brush(UNCHECKED_TEXT)?,
+            muted: brush(STATUS_TEXT)?,
+            outline: brush(OUTLINE)?,
+            meter: brush(0)?,
         })
     }
 }
@@ -116,20 +107,20 @@ impl Graphics {
                 DWRITE_FONT_WEIGHT_NORMAL,
                 DWRITE_FONT_STYLE_NORMAL,
                 DWRITE_FONT_STRETCH_NORMAL,
-                TEXT_SIZE,
+                DRAFT_SIZE as f32,
                 w!("en-us"),
             )?;
             text_format.SetWordWrapping(DWRITE_WORD_WRAPPING_WRAP)?;
             let status_format = dwrite.CreateTextFormat(
                 w!("Segoe UI"),
                 None,
-                DWRITE_FONT_WEIGHT_SEMI_BOLD,
+                DWRITE_FONT_WEIGHT_NORMAL,
                 DWRITE_FONT_STYLE_NORMAL,
                 DWRITE_FONT_STRETCH_NORMAL,
-                STATUS_SIZE,
+                STATUS_SIZE as f32,
                 w!("en-us"),
             )?;
-            status_format.SetWordWrapping(DWRITE_WORD_WRAPPING_NO_WRAP)?;
+            status_format.SetWordWrapping(DWRITE_WORD_WRAPPING_WRAP)?;
             Ok(Graphics {
                 d2d,
                 dwrite,
@@ -156,6 +147,7 @@ pub struct ScratchPad {
     visible: bool,
     /// Current size in pixels.
     size: (i32, i32),
+    region_size: Option<(i32, i32, i32)>,
 }
 
 impl ScratchPad {
@@ -189,7 +181,7 @@ impl ScratchPad {
                 Some(instance.into()),
                 None,
             )?;
-            SetLayeredWindowAttributes(hwnd, COLORREF(0), 245, LWA_ALPHA)?;
+            SetLayeredWindowAttributes(hwnd, COLORREF(0), 255, LWA_ALPHA)?;
 
             Ok(ScratchPad {
                 hwnd,
@@ -203,6 +195,7 @@ impl ScratchPad {
                 meter: PeakMeter::default(),
                 visible: false,
                 size: (0, 0),
+                region_size: None,
             })
         }
     }
@@ -276,11 +269,25 @@ impl ScratchPad {
         }
         let scale = self.scale();
         let height_dip = match self.graphics() {
-            Ok(g) => pad_height(g, &self.view, self.width_dip),
+            Ok(g) => pad_height(g, &self.status, &self.view, self.width_dip),
             Err(_) => return,
         };
         let width = (self.width_dip * scale).round() as i32;
         let height = (height_dip * scale).round() as i32;
+        let diameter = (2.0 * CORNER_RADIUS as f32 * scale).round() as i32;
+        if self.region_size != Some((width, height, diameter)) {
+            // A layered HWND uses whole-window opacity. Clip its opaque surface to the panel.
+            unsafe {
+                let region = CreateRoundRectRgn(0, 0, width + 1, height + 1, diameter, diameter);
+                if !region.is_invalid() {
+                    if SetWindowRgn(self.hwnd, Some(region), false) == 0 {
+                        let _ = DeleteObject(region.into());
+                    } else {
+                        self.region_size = Some((width, height, diameter));
+                    }
+                }
+            }
+        }
         let (cx, bottom) = self.anchor.unwrap_or_else(|| default_anchor(scale));
         unsafe {
             let _ = SetWindowPos(
@@ -386,8 +393,8 @@ impl ScratchPad {
             // The target keeps the DPI from its creation; the window can be on a different screen now.
             r.target.SetDpi(dpi, dpi);
             r.target.BeginDraw();
-            r.target.Clear(Some(&color(0.12, 0.12, 0.14)));
-            draw_pad(
+            r.target.Clear(Some(&rgb_color(OUTLINE)));
+            let result = draw_pad(
                 &r.target,
                 &r.brushes,
                 g,
@@ -396,33 +403,73 @@ impl ScratchPad {
                 &self.meter,
                 width,
                 height,
-            )?;
-            r.target.EndDraw(None, None)
+            );
+            let end = r.target.EndDraw(None, None);
+            result.and(end)
         }
     }
 }
 
-fn text_layout(g: &Graphics, view: &DraftView, width_dip: f32) -> Result<IDWriteTextLayout> {
-    let wide: Vec<u16> = view.full().encode_utf16().collect();
-    unsafe {
-        g.dwrite
-            .CreateTextLayout(&wide, &g.text_format, width_dip - 2.0 * PADDING, f32::MAX)
+impl Status {
+    fn label(&self) -> &str {
+        match self {
+            Self::Listening => "● Listening",
+            Self::Loading => "● Recording · loading models…",
+            Self::Finishing => "● Finishing…",
+            Self::Message(text) => text,
+        }
+    }
+
+    fn shows_meter(&self) -> bool {
+        matches!(self, Self::Listening | Self::Loading)
     }
 }
 
-/// The height in DIPs of a Scratch Pad that shows `view`: 1 to 10 lines of text.
-fn pad_height(g: &Graphics, view: &DraftView, width_dip: f32) -> f32 {
-    let mut metrics = DWRITE_TEXT_METRICS::default();
-    let ok = text_layout(g, view, width_dip)
-        .and_then(|layout| unsafe { layout.GetMetrics(&mut metrics) })
-        .is_ok();
-    let lines = if ok { metrics.lineCount.max(1) } else { 1 };
-    let line_height = if ok && metrics.lineCount > 0 {
-        metrics.height / metrics.lineCount as f32
+fn text_width(status: &Status, width: f32) -> f32 {
+    let meter_space = if status.shows_meter() {
+        (METER_WIDTH + METER_GAP) as f32
     } else {
-        TEXT_SIZE * 1.33
+        0.0
     };
-    2.0 * PADDING + STATUS_HEIGHT + GAP + lines.min(MAX_LINES) as f32 * line_height
+    width - 2.0 * INSET_X - meter_space
+}
+
+fn text_layout(
+    g: &Graphics,
+    text: &str,
+    format: &IDWriteTextFormat,
+    width: f32,
+) -> Result<IDWriteTextLayout> {
+    let wide: Vec<u16> = text.encode_utf16().collect();
+    unsafe { g.dwrite.CreateTextLayout(&wide, format, width, f32::MAX) }
+}
+
+fn text_height(layout: &IDWriteTextLayout) -> Result<f32> {
+    let mut metrics = DWRITE_TEXT_METRICS::default();
+    unsafe { layout.GetMetrics(&mut metrics)? };
+    Ok(metrics.height)
+}
+
+fn pad_height(g: &Graphics, status: &Status, view: &DraftView, width: f32) -> f32 {
+    let width = text_width(status, width);
+    let status_height = text_layout(g, status.label(), &g.status_format, width)
+        .and_then(|layout| text_height(&layout))
+        .unwrap_or(STATUS_SIZE as f32);
+    let draft = view.full();
+    let text_height = if draft.is_empty() {
+        status_height
+    } else {
+        let height = text_layout(g, &draft, &g.text_format, width)
+            .and_then(|layout| text_height(&layout))
+            .unwrap_or(DRAFT_SIZE as f32);
+        status_height + TEXT_GAP as f32 + height.min(DRAFT_HEIGHT as f32)
+    };
+    let meter_height = if status.shows_meter() {
+        METER_HEIGHT as f32
+    } else {
+        0.0
+    };
+    2.0 * INSET_Y + text_height.max(meter_height)
 }
 
 /// Draws the Scratch Pad at (0, 0) with the size `width` × `height` in DIPs, between the
@@ -439,72 +486,56 @@ fn draw_pad(
     height: f32,
 ) -> Result<()> {
     unsafe {
-        target.FillRoundedRectangle(
-            &D2D1_ROUNDED_RECT {
-                rect: rect(0.0, 0.0, width, height),
-                radiusX: CORNER,
-                radiusY: CORNER,
-            },
-            &r.background,
-        );
-
-        // Status row: a dot, a label, and the microphone level.
-        let (dot, label) = match status {
-            Status::Listening => (&r.recording, "Listening".to_owned()),
-            Status::Loading => (&r.waiting, "Recording · loading models…".to_owned()),
-            Status::Finishing => (&r.waiting, "Finishing…".to_owned()),
-            Status::Message(text) => (&r.waiting, text.clone()),
-        };
-        let row_center = PADDING + STATUS_HEIGHT / 2.0;
-        target.FillEllipse(
-            &D2D1_ELLIPSE {
-                point: windows_numerics::Vector2 {
-                    X: PADDING + 5.0,
-                    Y: row_center,
-                },
-                radiusX: 5.0,
-                radiusY: 5.0,
-            },
-            dot,
-        );
-        let wide: Vec<u16> = label.encode_utf16().collect();
-        let label_width = width - 2.0 * PADDING - 16.0 - LEVEL_WIDTH - 12.0;
-        target.DrawText(
-            &wide,
-            &g.status_format,
-            &rect(
-                PADDING + 16.0,
-                PADDING,
-                PADDING + 16.0 + label_width,
-                PADDING + STATUS_HEIGHT,
+        let panel = D2D1_ROUNDED_RECT {
+            rect: rect(
+                BORDER as f32 / 2.0,
+                BORDER as f32 / 2.0,
+                width - BORDER as f32 / 2.0,
+                height - BORDER as f32 / 2.0,
             ),
+            radiusX: CORNER_RADIUS as f32 - BORDER as f32 / 2.0,
+            radiusY: CORNER_RADIUS as f32 - BORDER as f32 / 2.0,
+        };
+        target.FillRoundedRectangle(&panel, &r.background);
+        target.DrawRoundedRectangle(&panel, &r.outline, BORDER as f32, None);
+
+        let width = text_width(status, width);
+        let status_layout = text_layout(g, status.label(), &g.status_format, width)?;
+        target.DrawTextLayout(
+            windows_numerics::Vector2 {
+                X: INSET_X,
+                Y: INSET_Y,
+            },
+            &status_layout,
             &r.muted,
             D2D1_DRAW_TEXT_OPTIONS_NONE,
-            windows::Win32::Graphics::DirectWrite::DWRITE_MEASURING_MODE_NATURAL,
         );
-        if matches!(status, Status::Listening | Status::Loading) {
-            let x0 = width - PADDING - LEVEL_WIDTH;
-            let x1 = x0 + LEVEL_WIDTH;
-            let bottom = row_center + LEVEL_HEIGHT / 2.0;
-            let step = LEVEL_HEIGHT / SEGMENTS as f32;
+        if status.shows_meter() {
+            let x0 = INSET_X + width + METER_GAP as f32;
+            let x1 = x0 + METER_WIDTH as f32;
+            let bottom = INSET_Y + METER_HEIGHT as f32;
+            let step = (METER_HEIGHT as f32 + SEGMENT_GAP) / SEGMENTS as f32;
             for (i, segment) in meter.segments().enumerate() {
                 let y = bottom - i as f32 * step;
-                let top = y - step + 1.0;
+                let top = y - step + SEGMENT_GAP;
                 let [red, green, blue] = segment.color;
                 r.meter.SetColor(&color(red, green, blue));
-                r.meter.SetOpacity(if segment.lit { 1.0 } else { 0.18 });
+                r.meter
+                    .SetOpacity(if segment.lit { 1.0 } else { UNLIT_OPACITY });
                 target.FillRectangle(&rect(x0, top, x1, y), &r.meter);
                 if segment.held {
-                    target.FillRectangle(&rect(x0, top - 1.0, x1, top), &r.text);
+                    target.FillRectangle(&rect(x0, top, x1, top + 1.0), &r.text);
                 }
             }
         }
 
-        // The Draft: checked words in white, Unchecked Words in grey. When there are more than
-        // 10 lines, the last 10 show.
-        let layout = text_layout(g, view, width)?;
+        let draft = view.full();
+        if draft.is_empty() {
+            return Ok(());
+        }
+        let layout = text_layout(g, &draft, &g.text_format, width)?;
         let checked_len = view.checked.encode_utf16().count() as u32;
-        let total_len = view.full().encode_utf16().count() as u32;
+        let total_len = draft.encode_utf16().count() as u32;
         if total_len > checked_len {
             layout.SetDrawingEffect(
                 &r.unchecked.cast::<windows::core::IUnknown>()?,
@@ -514,18 +545,16 @@ fn draw_pad(
                 },
             )?;
         }
-        let mut metrics = DWRITE_TEXT_METRICS::default();
-        layout.GetMetrics(&mut metrics)?;
-        let top = PADDING + STATUS_HEIGHT + GAP;
-        let visible_height = height - top - PADDING;
-        let offset = (metrics.height - visible_height).max(0.0);
+        let top = INSET_Y + text_height(&status_layout)? + TEXT_GAP as f32;
+        let visible_height = (height - top - INSET_Y).clamp(0.0, DRAFT_HEIGHT as f32);
+        let offset = (text_height(&layout)? - visible_height).max(0.0);
         target.PushAxisAlignedClip(
-            &rect(PADDING, top, width - PADDING, height - PADDING + 2.0),
+            &rect(INSET_X, top, INSET_X + width, top + visible_height),
             D2D1_ANTIALIAS_MODE_PER_PRIMITIVE,
         );
         target.DrawTextLayout(
             windows_numerics::Vector2 {
-                X: PADDING,
+                X: INSET_X,
                 Y: top - offset,
             },
             &layout,
@@ -535,6 +564,11 @@ fn draw_pad(
         target.PopAxisAlignedClip();
         Ok(())
     }
+}
+
+fn rgb_color(rgb: u32) -> D2D1_COLOR_F {
+    let channel = |shift: u32| ((rgb >> shift) & 0xff) as f32 / 255.0;
+    color(channel(16), channel(8), channel(0))
 }
 
 fn color(r: f32, g: f32, b: f32) -> D2D1_COLOR_F {
@@ -563,7 +597,7 @@ fn default_anchor(scale: f32) -> (i32, i32) {
     }
     (
         (area.left + area.right) / 2,
-        area.bottom - (DEFAULT_BOTTOM_MARGIN * scale) as i32,
+        area.bottom - (BOTTOM_MARGIN as f32 * scale) as i32,
     )
 }
 
@@ -630,7 +664,7 @@ pub mod offscreen {
     }
 
     impl Renderer {
-        /// A canvas for a Scratch Pad `width_dip` wide with up to 10 lines, at `scale` pixels per DIP.
+        /// A canvas for a Scratch Pad `width_dip` wide with a capped draft area, at `scale` pixels per DIP.
         pub fn new(width_dip: f32, scale: f32) -> Result<Renderer> {
             unsafe {
                 let _ = CoInitializeEx(None, COINIT_MULTITHREADED);
@@ -641,7 +675,9 @@ pub mod offscreen {
                 };
                 let canvas = (
                     width_dip + 2.0 * MARGIN,
-                    CAPTION_HEIGHT + pad_height(&graphics, &longest, width_dip) + 2.0 * MARGIN,
+                    CAPTION_HEIGHT
+                        + pad_height(&graphics, &Status::Listening, &longest, width_dip)
+                        + 2.0 * MARGIN,
                 );
                 let pixels = (even(canvas.0 * scale), even(canvas.1 * scale));
                 let wic: IWICImagingFactory =
@@ -697,7 +733,7 @@ pub mod offscreen {
             meter: &PeakMeter,
         ) -> Result<Vec<u8>> {
             let g = &self.graphics;
-            let height = pad_height(g, view, self.width_dip);
+            let height = pad_height(g, status, view, self.width_dip);
             unsafe {
                 let t = &self.target;
                 t.BeginDraw();
@@ -741,5 +777,47 @@ pub mod offscreen {
     /// A video encoder needs even frame sizes.
     fn even(x: f32) -> u32 {
         (x.round() as u32 + 1) & !1
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use windows::Win32::Graphics::Gdi::{CreateRectRgn, GetWindowRgn, PtInRegion};
+
+    #[test]
+    fn native_window_clips_the_corners_and_keeps_the_edges() {
+        let mut pad = ScratchPad::new(None, 320).expect("create Scratch Pad");
+        pad.show(Status::Listening);
+        for view in [
+            DraftView::default(),
+            DraftView {
+                checked: "The checked draft should wrap as the Scratch Pad grows. ".repeat(6),
+                unchecked: "These words are still unchecked.".into(),
+            },
+        ] {
+            pad.set_draft(view);
+            let (width, height) = pad.size;
+            unsafe {
+                let region = CreateRectRgn(0, 0, 0, 0);
+                assert!(!region.is_invalid());
+                let kind = GetWindowRgn(pad.hwnd, region);
+                let points = [
+                    (0, 0),
+                    (width - 1, height - 1),
+                    (width / 2, 0),
+                    (width / 2, height - 1),
+                    (width - 1, height / 2),
+                ];
+                let inside = points.map(|(x, y)| PtInRegion(region, x, y).as_bool());
+                let _ = DeleteObject(region.into());
+                assert_ne!(kind.0, 0, "the window must have a clipping region");
+                assert_eq!(inside, [false, false, true, true, true]);
+            }
+        }
+        pad.hide();
+        unsafe {
+            windows::Win32::UI::WindowsAndMessaging::DestroyWindow(pad.hwnd).unwrap();
+        }
     }
 }

@@ -1,0 +1,20 @@
+pub const CORNER_RADIUS: u32 = 14;
+pub const BORDER: u32 = 1;
+pub const HORIZONTAL_PADDING: u32 = 16;
+pub const VERTICAL_PADDING: u32 = 12;
+pub const TEXT_GAP: u32 = 7;
+pub const METER_GAP: u32 = 16;
+pub const STATUS_SIZE: u32 = 12;
+pub const DRAFT_SIZE: u32 = 17;
+pub const DRAFT_HEIGHT: u32 = 240;
+pub const METER_WIDTH: u32 = 16;
+pub const METER_HEIGHT: u32 = 40;
+pub const BOTTOM_MARGIN: u32 = 44;
+pub const SEGMENT_GAP: f32 = 1.5;
+pub const UNLIT_OPACITY: f32 = 0.18;
+
+pub const BACKGROUND: u32 = 0x17171c;
+pub const OUTLINE: u32 = 0x34343d;
+pub const STATUS_TEXT: u32 = 0xd9d9df;
+pub const CHECKED_TEXT: u32 = 0xf5f5f6;
+pub const UNCHECKED_TEXT: u32 = 0xa4a4ae;

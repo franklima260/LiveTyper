@@ -22,6 +22,7 @@ mod logging;
 mod meter;
 #[cfg(test)]
 mod model_tests;
+mod pad_style;
 #[cfg(windows)]
 mod paste;
 mod paths;

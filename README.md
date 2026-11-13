@@ -179,6 +179,15 @@ Each Dictation writes one line to the log: the audio length, where the speech st
 
 ## Testing
 
+Windows and Linux CI run the default tests in both CPU-only and Vulkan builds.
+The shared Dictation tests cover short taps, Escape, follow-up dictation, release deadlines,
+and fallback text selection. Run the same cases on either platform with
+`cargo test --locked --no-default-features dictation::tests`.
+
+The GTK Scratch Pad is the design reference. Both renderers use the dimensions and colors
+in `src/pad_style.rs`. When you change the design, compare the same draft on both desktops.
+Check the rounded corners, text wrap, and peak meter at normal and high display scaling.
+
 Run the unit tests. They need no models and no microphone:
 
 ```

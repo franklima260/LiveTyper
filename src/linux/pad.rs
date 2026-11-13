@@ -8,6 +8,7 @@ use gtk4_layer_shell::{Edge, KeyboardMode, Layer, LayerShell};
 
 use crate::draft::DraftView;
 use crate::meter::{PeakMeter, SEGMENTS};
+use crate::pad_style::*;
 
 pub enum Status<'a> {
     Listening,
@@ -38,32 +39,32 @@ impl ScratchPad {
         window.set_keyboard_mode(KeyboardMode::None);
         window.set_namespace(Some("livetyper-scratch-pad"));
         window.set_anchor(Edge::Bottom, true);
-        window.set_margin(Edge::Bottom, 44);
+        window.set_margin(Edge::Bottom, BOTTOM_MARGIN as i32);
         window.connect_realize(|window| {
             if let Some(surface) = window.surface() {
                 surface.set_input_region(Some(&gtk4::cairo::Region::create()));
             }
         });
 
-        let panel = gtk4::Box::new(gtk4::Orientation::Horizontal, 16);
+        let panel = gtk4::Box::new(gtk4::Orientation::Horizontal, METER_GAP as i32);
         panel.add_css_class("livetyper-panel");
         window.add_css_class("livetyper-window");
         let provider = gtk4::CssProvider::new();
-        provider.load_from_data(
-            ".livetyper-window { background: transparent; }
-             .livetyper-panel { background: #17171c; border: 1px solid #34343d;
-                                border-radius: 14px; padding: 12px 16px; }
-             .livetyper-status { color: #d9d9df; font-size: 12px; }
-             .livetyper-draft { color: #f5f5f6; font-size: 17px; }
-             .livetyper-panel scrollbar slider { min-width: 4px; min-height: 4px; margin: 0; }",
-        );
+        provider.load_from_data(&format!(
+            ".livetyper-window {{ background: transparent; }}
+             .livetyper-panel {{ background: #{BACKGROUND:06x}; border: {BORDER}px solid #{OUTLINE:06x};
+                                 border-radius: {CORNER_RADIUS}px; padding: {VERTICAL_PADDING}px {HORIZONTAL_PADDING}px; }}
+             .livetyper-status {{ color: #{STATUS_TEXT:06x}; font-size: {STATUS_SIZE}px; }}
+             .livetyper-draft {{ color: #{CHECKED_TEXT:06x}; font-size: {DRAFT_SIZE}px; }}
+             .livetyper-panel scrollbar slider {{ min-width: 4px; min-height: 4px; margin: 0; }}"
+        ));
         gtk4::style_context_add_provider_for_display(
             &gtk4::prelude::WidgetExt::display(&window),
             &provider,
             gtk4::STYLE_PROVIDER_PRIORITY_APPLICATION,
         );
 
-        let text = gtk4::Box::new(gtk4::Orientation::Vertical, 7);
+        let text = gtk4::Box::new(gtk4::Orientation::Vertical, TEXT_GAP as i32);
         text.set_hexpand(true);
         let status = gtk4::Label::new(None);
         status.add_css_class("livetyper-status");
@@ -82,7 +83,7 @@ impl ScratchPad {
             .hscrollbar_policy(gtk4::PolicyType::Never)
             .vscrollbar_policy(gtk4::PolicyType::External)
             .propagate_natural_height(true)
-            .max_content_height(240)
+            .max_content_height(DRAFT_HEIGHT as i32)
             .child(&draft)
             .build();
         let scroll_position = scroll.vadjustment();
@@ -95,14 +96,14 @@ impl ScratchPad {
         let peak = Rc::new(RefCell::new(PeakMeter::default()));
         let draw_peak = peak.clone();
         let meter = gtk4::DrawingArea::builder()
-            .content_width(16)
-            .content_height(40)
+            .content_width(METER_WIDTH as i32)
+            .content_height(METER_HEIGHT as i32)
             .valign(gtk4::Align::Start)
             .build();
         meter.set_draw_func(move |_, context, width, height| {
             let height = f64::from(height);
             let width = f64::from(width);
-            let gap = 1.5;
+            let gap = f64::from(SEGMENT_GAP);
             let segment_height = (height + gap) / SEGMENTS as f64 - gap;
             for (index, segment) in draw_peak.borrow().segments().enumerate() {
                 let y = height - (index as f64 + 1.0) * (segment_height + gap) + gap;
@@ -111,7 +112,11 @@ impl ScratchPad {
                     red.into(),
                     green.into(),
                     blue.into(),
-                    if segment.lit { 1.0 } else { 0.18 },
+                    if segment.lit {
+                        1.0
+                    } else {
+                        f64::from(UNLIT_OPACITY)
+                    },
                 );
                 context.rectangle(0.0, y, width, segment_height);
                 let _ = context.fill();
@@ -174,7 +179,7 @@ impl ScratchPad {
             " "
         };
         self.draft.set_markup(&format!(
-            "{checked}{space}<span foreground=\"#a4a4ae\">{unchecked}</span>"
+            "{checked}{space}<span foreground=\"#{UNCHECKED_TEXT:06x}\">{unchecked}</span>"
         ));
         self.draft
             .set_visible(!checked.is_empty() || !unchecked.is_empty());

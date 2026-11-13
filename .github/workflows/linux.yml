@@ -1,0 +1,42 @@
+name: Linux
+
+on:
+  push:
+  pull_request:
+
+jobs:
+  test:
+    runs-on: ubuntu-24.04
+    strategy:
+      fail-fast: false
+      matrix:
+        backend: [vulkan, cpu]
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - name: Install build dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install --no-install-recommends -y build-essential cmake libasound2-dev libgtk-4-dev libwayland-dev meson ninja-build pkg-config wayland-protocols
+      - name: Install Vulkan build dependencies
+        if: matrix.backend == 'vulkan'
+        run: sudo apt-get install --no-install-recommends -y glslc libvulkan-dev spirv-headers
+      - name: Build GTK4 Layer Shell
+        run: |
+          source="$RUNNER_TEMP/gtk4-layer-shell"
+          prefix="$RUNNER_TEMP/gtk4-layer-shell-install"
+          git init "$source"
+          git -C "$source" fetch --depth 1 https://github.com/wmww/gtk4-layer-shell.git 1c963c51514581c41b9bdae08cdf69171265cdda
+          git -C "$source" checkout FETCH_HEAD
+          meson setup "$source/build" "$source" --prefix "$prefix" --libdir lib -Dintrospection=false -Dvapi=false
+          meson install -C "$source/build"
+          echo "PKG_CONFIG_PATH=$prefix/lib/pkgconfig" >> "$GITHUB_ENV"
+          echo "LD_LIBRARY_PATH=$prefix/lib" >> "$GITHUB_ENV"
+      - run: cargo test --locked --all-targets
+        if: matrix.backend == 'vulkan'
+      - run: cargo test --locked --all-targets --no-default-features
+        if: matrix.backend == 'cpu'
+      - run: cargo build --locked
+        if: matrix.backend == 'vulkan'
+      - run: cargo build --locked --no-default-features
+        if: matrix.backend == 'cpu'
