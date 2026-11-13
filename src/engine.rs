@@ -432,7 +432,7 @@ impl Dictation<'_> {
 
         let mut fed = 0;
         let mut active: Option<ActiveRecast> = None;
-        let mut last_recast = Instant::now();
+        let mut next_preview = Instant::now() + self.config.recast_interval;
         let mut stopping = false;
         let mut finishing = false;
         let mut live_finished = false;
@@ -456,6 +456,12 @@ impl Dictation<'_> {
                                 return;
                             }
                         } else {
+                            // A running Parakeet preview can hold the worker until decode
+                            // returns. Leave time for the final pass between slow previews.
+                            let decode =
+                                Duration::from_millis(result.took_ms.min(u64::MAX as u128) as u64);
+                            next_preview = next_preview
+                                .max(Instant::now() + decode.min(self.config.recast_interval));
                             self.apply_preview(result);
                         }
                     }
@@ -481,11 +487,11 @@ impl Dictation<'_> {
             } else if !closed
                 && !stopping
                 && active.is_none()
-                && last_recast.elapsed() >= self.config.recast_interval
+                && Instant::now() >= next_preview
                 && available >= MIN_RECAST_SAMPLES
             {
                 active = self.send_job(jobs, available, false, None);
-                last_recast = Instant::now();
+                next_preview = Instant::now() + self.config.recast_interval;
             }
 
             // Work in single chunks so release/closure can overtake a backlog of live audio.

@@ -433,14 +433,28 @@ fn keep_shown_forms(shown: &[TimedWord], new: Vec<TimedWord>) -> Vec<TimedWord> 
     let (mut i0, mut j0) = (0, 0);
     for (i, j) in common_words(&a, &b) {
         flush(&mut out, (i0, i), (j0, j));
+        let previous = &shown[i].text;
+        let current = &new[j].text;
+        let text = if !has_numeric_separator(previous) && has_numeric_separator(current) {
+            current
+        } else {
+            previous
+        };
         out.push(TimedWord {
-            text: shown[i].text.clone(),
+            text: text.clone(),
             ..new[j].clone()
         });
         (i0, j0) = (i + 1, j + 1);
     }
     flush(&mut out, (i0, a.len()), (j0, b.len()));
     out
+}
+
+/// A separator between digits carries information that normal_word omits.
+fn has_numeric_separator(text: &str) -> bool {
+    text.as_bytes().windows(3).any(|bytes| {
+        bytes[0].is_ascii_digit() && matches!(bytes[1], b':' | b'.') && bytes[2].is_ascii_digit()
+    })
 }
 
 /// The pairs (i, j) of a longest common subsequence of `a` and `b`, in order. Of two equal
@@ -577,6 +591,19 @@ mod tests {
         assert_eq!(d.view().full(), "Friday");
         assert!(!d.accept_final_recast(0, 2600, 15_000, words(&[("…", 200, 300)])));
         assert_eq!(d.unusable_recast_fallback(2600, 15_000), "Friday");
+    }
+
+    #[test]
+    fn fallback_keeps_the_numeric_separator_once_a_recast_hears_it() {
+        let mut d = Draft::default();
+        for text in ["1145", "11.45", "1145"] {
+            d.apply_recast(0, 3000, words(&[(text, 700, 1200)]));
+        }
+        d.set_live_text("1145", 1200);
+        d.set_live_text("1145 works", 3000);
+        assert_eq!(d.view().full(), "11.45 works");
+        assert!(!d.accept_final_recast(0, 3000, 15_000, vec![]));
+        assert_eq!(d.unusable_recast_fallback(3000, 15_000), "11.45 works");
     }
 
     #[test]
