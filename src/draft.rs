@@ -53,6 +53,7 @@ pub struct Draft {
     checked: Vec<TimedWord>,
     checked_until_ms: i64,
     live: Vec<LiveWord>,
+    preview_numbers: Vec<TimedWord>,
 }
 
 /// The live words have only approximate times. To find where the Unchecked Words start, this many
@@ -196,6 +197,24 @@ impl Draft {
             return false;
         }
         let mut words = after_boundary(words, boundary_ms);
+        // A preview can hear the format of a number before the settled cut reaches it.
+        // Keep that evidence for matching live words, even if the preview cannot check them yet.
+        self.preview_numbers
+            .retain(|word| word.t1_ms >= boundary_ms);
+        for word in words
+            .iter()
+            .filter(|word| has_numeric_separator(&word.text) && word.t1_ms <= end_ms - 300)
+        {
+            let mut word = word.clone();
+            word.text = word
+                .text
+                .trim_matches(|c: char| !c.is_ascii_digit())
+                .to_owned();
+            self.preview_numbers.retain(|old| {
+                old.text != word.text || old.t1_ms <= word.t0_ms || word.t1_ms <= old.t0_ms
+            });
+            self.preview_numbers.push(word);
+        }
         if let Some(cut) = self.settled_cut(&words, end_ms) {
             words.truncate(cut.fix);
             // A punctuation-only preview can hide live words by advancing the checked boundary.
@@ -348,10 +367,25 @@ impl Draft {
             checked: checked.join(" "),
             unchecked: unchecked
                 .iter()
-                .map(|w| w.text.as_str())
+                .map(|w| self.live_form(w))
                 .collect::<Vec<_>>()
                 .join(" "),
         }
+    }
+
+    fn live_form<'a>(&'a self, word: &'a LiveWord) -> &'a str {
+        if word.text.is_empty() || !word.text.bytes().all(|byte| byte.is_ascii_digit()) {
+            return &word.text;
+        }
+        self.preview_numbers
+            .iter()
+            .rev()
+            .find(|heard| {
+                word.at_ms >= heard.t0_ms - MATCH_WINDOW_MS
+                    && word.at_ms <= heard.t1_ms + MATCH_WINDOW_MS
+                    && normal_word(&heard.text) == word.text
+            })
+            .map_or(word.text.as_str(), |heard| heard.text.as_str())
     }
 
     /// The index of the first Unchecked Word in the live words. The last checked words are matched
@@ -665,6 +699,16 @@ mod tests {
 
         assert!(draft.apply_fallback_preview(0, 3000, vec![]).is_none());
         assert_eq!(draft.view().full(), "11.45");
+    }
+
+    #[test]
+    fn an_unsettled_preview_supplies_only_matching_number_formatting() {
+        let mut draft = Draft::default();
+        draft.set_live_text("1145", 1200);
+        draft.apply_recast(0, 1800, words(&[("11.45.", 700, 1200)]));
+        assert_eq!(draft.view(), view("", "11.45"));
+        draft.set_live_text("1146", 1300);
+        assert_eq!(draft.view(), view("", "1146"));
     }
 
     #[test]
