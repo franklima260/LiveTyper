@@ -207,6 +207,10 @@ impl RecastResult {
     fn is_for(&self, generation: u64, active: Option<&ActiveRecast>) -> bool {
         self.generation == generation && active.is_some_and(|job| job.id == self.id)
     }
+
+    fn is_fallback_preview(&self, generation: u64, preview_id: Option<u64>) -> bool {
+        self.generation == generation && !self.last && preview_id == Some(self.id)
+    }
 }
 
 struct ActiveRecast {
@@ -287,7 +291,7 @@ fn recast_worker(mut session: Session, jobs: &Receiver<RecastJob>, results: &Sen
         session.set_cancel_token(&job.cancel);
         let decoded = session.run(&job.pcm, &options);
         session.clear_cancel_token();
-        if job.cancel.is_cancelled() {
+        if job.cancel.is_cancelled() && (job.last || decoded.is_err()) {
             continue;
         }
         let words = match decoded {
@@ -432,6 +436,8 @@ impl Dictation<'_> {
 
         let mut fed = 0;
         let mut active: Option<ActiveRecast> = None;
+        let mut fallback_preview_id = None;
+        let mut final_draft = None;
         let mut next_preview = Instant::now() + self.config.recast_interval;
         let mut stopping = false;
         let mut finishing = false;
@@ -444,16 +450,21 @@ impl Dictation<'_> {
                 Poll::End => return,
             }
 
-            // Consume a ready preview before observing capture closure. Once the final job is
-            // dispatched, only that job can update the finished Draft.
+            // Consume a ready preview before observing capture closure.
             loop {
                 match results.try_recv() {
                     Ok(result) if result.is_for(self.generation, active.as_ref()) => {
                         active = None;
                         if result.last {
+                            let fallback_draft = final_draft
+                                .take()
+                                .map(|draft| std::mem::replace(&mut self.draft, draft));
                             if self.apply_final(result) {
                                 self.finish(self.draft.final_text(), FinalSelection::Recast);
                                 return;
+                            }
+                            if let Some(draft) = fallback_draft {
+                                self.draft = draft;
                             }
                         } else {
                             // A running Parakeet preview can hold the worker until decode
@@ -461,9 +472,18 @@ impl Dictation<'_> {
                             let decode =
                                 Duration::from_millis(result.took_ms.min(u64::MAX as u128) as u64);
                             next_preview = next_preview
-                                .max(Instant::now() + decode.min(self.config.recast_interval));
+                                .max(Instant::now() + decode.min(self.config.recast_interval * 2));
                             self.apply_preview(result);
                         }
+                    }
+                    Ok(result)
+                        if result.is_fallback_preview(self.generation, fallback_preview_id) =>
+                    {
+                        fallback_preview_id = None;
+                        // The final job already has its planned cut. A successful preview that
+                        // finished despite cancellation can still improve the deadline draft.
+                        final_draft = Some(self.draft.clone());
+                        self.apply_preview(result);
                     }
                     Ok(_) => {}
                     Err(TryRecvError::Disconnected) => {
@@ -482,6 +502,7 @@ impl Dictation<'_> {
             if stopping && closed && !finishing {
                 finishing = true;
                 let cancelled_at = active.as_ref().map(|_| Instant::now());
+                fallback_preview_id = active.as_ref().map(|job| job.id);
                 drop(active.take());
                 active = self.send_job(jobs, available, true, cancelled_at);
             } else if !closed
@@ -741,6 +762,16 @@ mod tests {
         assert!(token.is_cancelled());
         assert!(!result.is_for(4, Some(&final_job)));
         assert!(!result.is_for(4, None));
+        assert!(result.is_fallback_preview(4, Some(1)));
+        assert!(!result.is_fallback_preview(4, Some(2)));
+        assert!(!result.is_fallback_preview(5, Some(1)));
+        assert!(
+            !RecastResult {
+                last: true,
+                ..result
+            }
+            .is_fallback_preview(4, Some(1))
+        );
         let next_preview = ActiveRecast {
             id: 1,
             cancel: CancelToken::new(),

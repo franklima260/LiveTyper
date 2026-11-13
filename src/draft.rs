@@ -46,7 +46,7 @@ impl DraftView {
     }
 }
 
-#[derive(Debug, Default)]
+#[derive(Debug, Default, Clone)]
 pub struct Draft {
     fixed: Vec<String>,
     fixed_until_ms: i64,
