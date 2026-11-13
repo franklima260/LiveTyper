@@ -11,71 +11,12 @@ use crate::draft::{DraftView, has_words};
 /// A completed engine selection is authoritative, including an empty result.
 /// Without one, the insertion deadline uses the latest draft with words.
 pub fn insertion_text(final_text: Option<String>, draft: &DraftView) -> String {
-    let text = final_text.unwrap_or_else(|| format_fallback_times(draft.full()));
+    let text = final_text.unwrap_or_else(|| draft.full());
     if has_words(&text) {
         text
     } else {
         String::new()
     }
-}
-
-/// Restore the separator in a compact clock time after an explicit start time.
-/// The start/end wording and the first time distinguish this from a bare number.
-pub(crate) fn format_fallback_times(text: String) -> String {
-    let words: Vec<_> = text.split_whitespace().collect();
-    let mut edits = Vec::new();
-    for (index, word) in words.iter().enumerate() {
-        if !matches!(*word, "starts" | "begins") || words.get(index + 1) != Some(&"at") {
-            continue;
-        }
-        let Some(first) = words.get(index + 2) else {
-            continue;
-        };
-        let (separator, after_first) = match first.split_once([':', '.']) {
-            Some((hour, minute)) if valid_clock(hour, minute) => {
-                (if first.contains(':') { ':' } else { '.' }, index + 3)
-            }
-            None if words
-                .get(index + 3)
-                .is_some_and(|minute| valid_clock(first, minute)) =>
-            {
-                (':', index + 4)
-            }
-            _ => continue,
-        };
-        let Some(["and", "ends" | "finishes", "at", second]) =
-            words.get(after_first..after_first + 4)
-        else {
-            continue;
-        };
-        let digits = second.trim_end_matches(['.', ',', '!', '?']);
-        if !matches!(digits.len(), 3 | 4) || !digits.bytes().all(|byte| byte.is_ascii_digit()) {
-            continue;
-        }
-        let (hour, minute) = digits.split_at(digits.len() - 2);
-        if valid_clock(hour, minute) {
-            edits.push((
-                second.as_ptr() as usize - text.as_ptr() as usize + hour.len(),
-                separator,
-            ));
-        }
-    }
-    let mut text = text;
-    for (offset, separator) in edits.into_iter().rev() {
-        text.insert(offset, separator);
-    }
-    text
-}
-
-fn valid_clock(hour: &str, minute: &str) -> bool {
-    matches!(hour.len(), 1 | 2)
-        && minute.len() == 2
-        && hour
-            .bytes()
-            .chain(minute.bytes())
-            .all(|byte| byte.is_ascii_digit())
-        && hour.parse::<u8>().is_ok_and(|value| value < 24)
-        && minute.parse::<u8>().is_ok_and(|value| value < 60)
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -243,33 +184,31 @@ mod tests {
     }
 
     #[test]
-    fn fallback_restores_clock_separator_with_an_explicit_start_and_end() {
-        for (input, expected) in [
-            (
-                "The meeting starts at 9.30 and ends at 1145.",
-                "The meeting starts at 9.30 and ends at 11.45.",
-            ),
-            (
-                "It starts at 9 30 and ends at 1145.",
-                "It starts at 9 30 and ends at 11:45.",
-            ),
-            (
-                "The range starts at 900 and ends at 1145.",
-                "The range starts at 900 and ends at 1145.",
-            ),
-            (
-                "It starts at 9:30 and ends at 1199.",
-                "It starts at 9:30 and ends at 1199.",
-            ),
-            ("Enter code 1145.", "Enter code 1145."),
+    fn fallback_preserves_the_numbers_in_the_draft() {
+        for text in [
+            "The meeting starts at 9.30 and ends at 1145.",
+            "It starts at 9 30 and ends at 1145.",
+            "It starts at 9:30 and ends at 1199.",
+            "The meeting starts at 9:30 and ends at 11:45.",
+            "Enter code 1145.",
         ] {
             let draft = DraftView {
-                checked: input.into(),
+                checked: text.into(),
                 unchecked: String::new(),
             };
-            assert_eq!(insertion_text(None, &draft), expected);
-            assert_eq!(insertion_text(Some(input.into()), &draft), input);
+            assert_eq!(insertion_text(None, &draft), text);
+            assert_eq!(insertion_text(Some(text.into()), &draft), text);
         }
+    }
+
+    #[test]
+    fn fallback_preserves_numeric_range_endpoints() {
+        let text = "The pressure range starts at 9.30 and ends at 1145.";
+        let draft = DraftView {
+            checked: String::new(),
+            unchecked: text.to_owned(),
+        };
+        assert_eq!(insertion_text(None, &draft), text);
     }
 
     #[test]
