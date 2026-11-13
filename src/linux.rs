@@ -430,8 +430,7 @@ impl App {
     }
 }
 
-// ydotool converts ASCII to physical US key positions. An unknown layout or a
-// layout variant is handled by the same clipboard fallback as Unicode text.
+// ydotool sends physical US key positions. Use the clipboard if KWin cannot confirm the layout.
 fn uses_us_layout(bus: &gio::DBusConnection) -> Option<bool> {
     let query = |method| {
         bus.call_sync(
@@ -451,8 +450,12 @@ fn uses_us_layout(bus: &gio::DBusConnection) -> Option<bool> {
         .try_child_get::<Vec<(String, String, String)>>(0)
         .ok()??;
     let active = query("getLayout")?.try_child_get::<u32>(0).ok()?? as usize;
-    let (layout, variant, _) = layouts.get(active)?;
-    Some(layout == "us" && variant.is_empty())
+    Some(is_plain_us_layout(layouts.get(active)?))
+}
+
+fn is_plain_us_layout((short_name, _, long_name): &(String, String, String)) -> bool {
+    // KWin returns the layout code, the user display name, and the translated XKB name.
+    short_name == "us" && long_name == "English (US)"
 }
 
 fn type_text(text: &str, bus: Option<&gio::DBusConnection>) -> std::io::Result<()> {
@@ -497,4 +500,28 @@ fn copy_to_plasma_clipboard(bus: &gio::DBusConnection, text: &str) -> bool {
         gio::Cancellable::NONE,
     )
     .is_ok()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::is_plain_us_layout;
+
+    #[test]
+    fn kde_layout_check_uses_the_long_name_and_ignores_the_display_name() {
+        assert!(!is_plain_us_layout(&(
+            "us".into(),
+            String::new(),
+            "English (Dvorak)".into(),
+        )));
+        assert!(is_plain_us_layout(&(
+            "us".into(),
+            "Work keyboard".into(),
+            "English (US)".into(),
+        )));
+        assert!(!is_plain_us_layout(&(
+            "gb".into(),
+            "English (US)".into(),
+            "English (UK)".into(),
+        )));
+    }
 }

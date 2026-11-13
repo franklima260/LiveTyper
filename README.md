@@ -103,7 +103,7 @@ LiveTyper uses the same Nemotron and Parakeet models on Windows and Linux. On KD
 
 Linux settings are in `${XDG_CONFIG_HOME:-~/.config}/livetyper/settings.toml`. Models and the log are in `${XDG_DATA_HOME:-~/.local/share}/livetyper/`. The Scratch Pad is anchored at the bottom of the screen.
 
-The preview sends basic text through ydotool to the currently focused app after the modifiers are released. Keep focus in the intended text field through insertion. For text the keyboard driver cannot enter or when the driver reports an error, LiveTyper copies the draft through Plasma’s clipboard and prompts you to paste it. Clipboard history can retain that text. Automatic keyboard insertion requires the plain US layout. The Linux preview runs from the terminal and uses the desktop's shortcut handling alongside its Talk Key.
+The preview sends basic text through ydotool to the currently focused app after the modifiers are released. Keep focus in the intended text field through insertion. For text the keyboard driver cannot enter or when the driver reports an error, LiveTyper copies the draft through Plasma’s clipboard and prompts you to paste it. Clipboard history can retain that text. Automatic keyboard insertion requires KDE to report the layout as English (US). For other layout names, including translated names, LiveTyper uses the clipboard. The Linux preview runs from the terminal and uses the desktop's shortcut handling alongside its Talk Key.
 
 ## Speech acceleration
 
