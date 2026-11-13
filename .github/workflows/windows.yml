@@ -15,14 +15,20 @@ jobs:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@stable
       - uses: ilammy/msvc-dev-cmd@v1
-      - uses: humbletim/install-vulkan-sdk@v1.2
+      - uses: jakoch/install-vulkan-sdk-action@v1.6.0
         if: matrix.backend == 'vulkan'
         with:
-          version: '1.4.341.0'
+          vulkan_version: '1.4.341.0'
+          install_runtime: true
       - name: Configure SPIR-V headers
         if: matrix.backend == 'vulkan'
         shell: pwsh
         run: |
+          foreach ($file in 'Include/vulkan/vulkan.h', 'Lib/vulkan-1.lib', 'Bin/glslc.exe') {
+            if (!(Test-Path (Join-Path $env:VULKAN_SDK $file))) {
+              throw "Missing Vulkan SDK component: $file"
+            }
+          }
           $source = Join-Path $env:RUNNER_TEMP spirv-headers
           $prefix = Join-Path $env:RUNNER_TEMP spirv-prefix
           git init $source
