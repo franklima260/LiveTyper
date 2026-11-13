@@ -37,6 +37,7 @@ use windows::Win32::UI::WindowsAndMessaging::{
 use windows::core::{Error, Interface, Result, w};
 
 use crate::draft::DraftView;
+use crate::meter::{PeakMeter, SEGMENTS};
 
 // Sizes in DIPs (1/96 inch).
 const PADDING: f32 = 14.0;
@@ -45,7 +46,8 @@ const GAP: f32 = 8.0;
 const TEXT_SIZE: f32 = 18.0;
 const STATUS_SIZE: f32 = 12.5;
 const MAX_LINES: u32 = 10;
-const LEVEL_WIDTH: f32 = 90.0;
+const LEVEL_WIDTH: f32 = 18.0;
+const LEVEL_HEIGHT: f32 = 26.0;
 const CORNER: f32 = 10.0;
 /// Distance from the bottom of the work area when no position is set.
 const DEFAULT_BOTTOM_MARGIN: f32 = 24.0;
@@ -76,7 +78,7 @@ struct Brushes {
     muted: ID2D1SolidColorBrush,
     recording: ID2D1SolidColorBrush,
     waiting: ID2D1SolidColorBrush,
-    track: ID2D1SolidColorBrush,
+    meter: ID2D1SolidColorBrush,
 }
 
 impl Brushes {
@@ -90,7 +92,7 @@ impl Brushes {
             muted: brush(0.70, 0.70, 0.72)?,
             recording: brush(0.90, 0.28, 0.30)?,
             waiting: brush(0.96, 0.65, 0.14)?,
-            track: brush(0.25, 0.25, 0.28)?,
+            meter: brush(0.0, 0.0, 0.0)?,
         })
     }
 }
@@ -150,7 +152,7 @@ pub struct ScratchPad {
     width_dip: f32,
     status: Status,
     view: DraftView,
-    level: f32,
+    meter: PeakMeter,
     visible: bool,
     /// Current size in pixels.
     size: (i32, i32),
@@ -198,7 +200,7 @@ impl ScratchPad {
                 width_dip: width_dip.max(240) as f32,
                 status: Status::Listening,
                 view: DraftView::default(),
-                level: 0.0,
+                meter: PeakMeter::default(),
                 visible: false,
                 size: (0, 0),
             })
@@ -218,7 +220,7 @@ impl ScratchPad {
         }
         self.status = status;
         self.view = DraftView::default();
-        self.level = 0.0;
+        self.meter = PeakMeter::default();
         self.visible = true;
         self.failed_draws = 0;
         self.layout();
@@ -248,8 +250,7 @@ impl ScratchPad {
     }
 
     pub fn set_level(&mut self, level: f32) {
-        if (self.level - level).abs() > 0.01 {
-            self.level = level;
+        if self.meter.update(level) {
             self.invalidate();
         }
     }
@@ -392,7 +393,7 @@ impl ScratchPad {
                 g,
                 &self.status,
                 &self.view,
-                self.level,
+                &self.meter,
                 width,
                 height,
             )?;
@@ -433,7 +434,7 @@ fn draw_pad(
     g: &Graphics,
     status: &Status,
     view: &DraftView,
-    level: f32,
+    meter: &PeakMeter,
     width: f32,
     height: f32,
 ) -> Result<()> {
@@ -483,9 +484,20 @@ fn draw_pad(
         );
         if matches!(status, Status::Listening | Status::Loading) {
             let x0 = width - PADDING - LEVEL_WIDTH;
-            let bar = |x1: f32| rect(x0, row_center - 2.0, x1, row_center + 2.0);
-            target.FillRectangle(&bar(x0 + LEVEL_WIDTH), &r.track);
-            target.FillRectangle(&bar(x0 + LEVEL_WIDTH * level.clamp(0.0, 1.0)), &r.recording);
+            let x1 = x0 + LEVEL_WIDTH;
+            let bottom = row_center + LEVEL_HEIGHT / 2.0;
+            let step = LEVEL_HEIGHT / SEGMENTS as f32;
+            for (i, segment) in meter.segments().enumerate() {
+                let y = bottom - i as f32 * step;
+                let top = y - step + 1.0;
+                let [red, green, blue] = segment.color;
+                r.meter.SetColor(&color(red, green, blue));
+                r.meter.SetOpacity(if segment.lit { 1.0 } else { 0.18 });
+                target.FillRectangle(&rect(x0, top, x1, y), &r.meter);
+                if segment.held {
+                    target.FillRectangle(&rect(x0, top - 1.0, x1, top), &r.text);
+                }
+            }
         }
 
         // The Draft: checked words in white, Unchecked Words in grey. When there are more than
@@ -682,7 +694,7 @@ pub mod offscreen {
             caption: &str,
             status: &Status,
             view: &DraftView,
-            level: f32,
+            meter: &PeakMeter,
         ) -> Result<Vec<u8>> {
             let g = &self.graphics;
             let height = pad_height(g, view, self.width_dip);
@@ -710,7 +722,7 @@ pub mod offscreen {
                     g,
                     status,
                     view,
-                    level,
+                    meter,
                     self.width_dip,
                     height,
                 )?;

@@ -17,6 +17,7 @@ use std::process::{Command, Stdio};
 use transcribe_cpp::{Model, RunOptions, SessionOptions, TimestampKind};
 
 use super::*;
+use crate::meter::{PeakMeter, normalized_peak};
 use crate::scratch_pad::Status;
 use crate::scratch_pad::offscreen::Renderer;
 
@@ -151,18 +152,6 @@ fn with_noise(samples: &[f32], rms: f32) -> Vec<f32> {
 
 fn rms(samples: &[f32]) -> f32 {
     (samples.iter().map(|s| s * s).sum::<f32>() / samples.len().max(1) as f32).sqrt()
-}
-
-/// The microphone level that the Scratch Pad shows at `t_ms`: the RMS of the last 100 ms, mapped
-/// from -60..0 dBFS to 0..1 (as `audio::level`).
-fn level_at(samples: &[f32], t_ms: i64) -> f32 {
-    let end = (t_ms.max(0) as usize * SAMPLE_RATE / 1000).min(samples.len());
-    let start = end.saturating_sub(CHUNK);
-    if end == start {
-        return 0.0;
-    }
-    let r = rms(&samples[start..end]);
-    ((20.0 * r.max(1e-9).log10() + 60.0) / 60.0).clamp(0.0, 1.0)
 }
 
 fn percentile<T: Copy + Ord + Default>(values: &[T], p: f64) -> T {
@@ -407,6 +396,9 @@ fn make_video(
     let mut view = DraftView::default();
     let mut next = 0;
     let frames = (trace.final_ms + FINAL_HOLD_MS) * FPS / 1000;
+    let mut meter = PeakMeter::default();
+    let mut previous_sample = 0;
+    let started = Instant::now();
     for frame in 0..=frames {
         let t = frame * 1000 / FPS;
         while next < trace.shown.len() && trace.shown[next].at_ms <= t {
@@ -423,12 +415,16 @@ fn make_video(
             (Status::Listening, &view)
         };
         let level = if t < trace.release_ms {
-            level_at(samples, t)
+            let sample = (t as usize * SAMPLE_RATE / 1000).min(samples.len());
+            let peak = normalized_peak(&samples[previous_sample..sample]);
+            previous_sample = sample;
+            peak
         } else {
             0.0
         };
+        meter.update_at(level, started + Duration::from_millis(t as u64));
         let pixels = renderer
-            .frame(&caption(name, t, trace, revisions), &status, shown, level)
+            .frame(&caption(name, t, trace, revisions), &status, shown, &meter)
             .map_err(|e| e.to_string())?;
         input
             .write_all(&pixels)
