@@ -7,8 +7,32 @@ on:
 jobs:
   test:
     runs-on: windows-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        backend: [vulkan, cpu]
     steps:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@stable
       - uses: ilammy/msvc-dev-cmd@v1
+      - uses: humbletim/install-vulkan-sdk@v1.2
+        if: matrix.backend == 'vulkan'
+        with:
+          version: '1.4.341.0'
+      - name: Configure SPIR-V headers
+        if: matrix.backend == 'vulkan'
+        shell: pwsh
+        run: |
+          $source = Join-Path $env:RUNNER_TEMP spirv-headers
+          $prefix = Join-Path $env:RUNNER_TEMP spirv-prefix
+          git init $source
+          git -C $source fetch --depth 1 https://github.com/KhronosGroup/SPIRV-Headers.git 6efe5ae6b7c6ad29da3f2cc3f164b9c3d72b78b1
+          git -C $source checkout FETCH_HEAD
+          cmake -S $source -B "$source/build" "-DCMAKE_INSTALL_PREFIX=$prefix"
+          cmake --install "$source/build"
+          "CMAKE_PREFIX_PATH=$prefix" >> $env:GITHUB_ENV
+          "CXXFLAGS=/I`"$prefix/include`"" >> $env:GITHUB_ENV
       - run: cargo test --locked --all-targets
+        if: matrix.backend == 'vulkan'
+      - run: cargo test --locked --all-targets --no-default-features
+        if: matrix.backend == 'cpu'

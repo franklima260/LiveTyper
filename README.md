@@ -105,6 +105,14 @@ Linux settings are in `${XDG_CONFIG_HOME:-~/.config}/livetyper/settings.toml`. M
 
 The preview sends basic text through ydotool to the currently focused app after the modifiers are released. Keep focus in the intended text field through insertion. For text the keyboard driver cannot enter or when the driver reports an error, LiveTyper copies the draft through Plasma’s clipboard and prompts you to paste it. Clipboard history can retain that text. Automatic keyboard insertion requires the plain US layout. The Linux preview runs from the terminal and uses the desktop's shortcut handling alongside its Talk Key.
 
+## Speech acceleration
+
+The default build includes Vulkan. On a compatible GPU and driver the speech runtime can use Vulkan, with CPU available as a fallback. LiveTyper logs the backend selected for each model when it loads. The AVX2 build floor also applies to Vulkan builds.
+
+For a default Windows build, install the Vulkan SDK and make its tools available in the build environment. If your SDK does not include the SPIR-V Headers CMake package, install SPIR-V Headers to a separate prefix, add that prefix to `CMAKE_PREFIX_PATH`, and add its include directory to `CXXFLAGS` (see the Windows workflow). On Linux, install the Vulkan loader and driver for your GPU, Vulkan and SPIR-V development headers, and `glslc`. The built app needs the loader and driver at runtime.
+
+Use `cargo build --release --locked --no-default-features` for a CPU-only binary, for example when building on a machine without the Vulkan development tools. The original CPU-only benchmarks in the research notes are historical.
+
 ## Model setup (one time)
 
 Run this script one time:

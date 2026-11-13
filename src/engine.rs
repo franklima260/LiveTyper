@@ -194,6 +194,7 @@ impl Models {
         let session = |path: &Path, n_threads: i32| -> Result<Session, String> {
             let model = Model::load(path)
                 .map_err(|e| format!("The model {} cannot load: {e}", path.display()))?;
+            log::info!("model {} backend {}", path.display(), model.backend());
             model
                 .session_with(&SessionOptions {
                     n_threads,
