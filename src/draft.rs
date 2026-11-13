@@ -219,6 +219,15 @@ impl Draft {
         let mut candidate = self.clone();
         if !candidate.apply_recast(boundary_ms, end_ms, words)
             || candidate.checked_until_ms < self.checked_until_ms
+            || self.checked.iter().any(|old| {
+                has_numeric_separator(&old.text)
+                    && !candidate.checked.iter().any(|new| {
+                        has_numeric_separator(&new.text)
+                            && new.t0_ms < old.t1_ms
+                            && old.t0_ms < new.t1_ms
+                            && normal_word(&new.text) == normal_word(&old.text)
+                    })
+            })
         {
             return None;
         }
@@ -646,6 +655,16 @@ mod tests {
         d.set_live_text("1145", 1200);
         assert!(d.apply_fallback_preview(0, 2000, vec![]).is_none());
         assert_eq!(d.view().full(), "11.45");
+    }
+
+    #[test]
+    fn a_late_preview_cannot_drop_a_checked_time_at_the_same_cut() {
+        let mut draft = Draft::default();
+        draft.apply_recast(0, 3000, words(&[("11.45", 700, 1200)]));
+        draft.set_live_text("1145", 1200);
+
+        assert!(draft.apply_fallback_preview(0, 3000, vec![]).is_none());
+        assert_eq!(draft.view().full(), "11.45");
     }
 
     #[test]
