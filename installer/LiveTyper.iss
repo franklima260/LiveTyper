@@ -35,6 +35,7 @@ AppMutex=Local\LiveTyper.SingleInstance
 RestartApplications=no
 
 [Files]
+Source: "..\assets\fonts\DejaVuSans-LICENSE.txt"; DestDir: "{app}\licenses"; Flags: ignoreversion
 Source: "..\target\release\livetyper.exe"; DestDir: "{app}"; Flags: ignoreversion
 Source: "{#VcRedist}"; DestDir: "{tmp}"; DestName: "vc_redist.x64.exe"; Flags: deleteafterinstall; Check: VcRuntimeMissing
 

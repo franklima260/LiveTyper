@@ -7,32 +7,38 @@
 //! The Direct2D and DirectWrite objects use much memory (Direct2D loads the graphics driver), so
 //! they are made on the first show, and the render target is released when the Scratch Pad hides.
 
-use windows::Win32::Foundation::{COLORREF, E_FAIL, HWND, LPARAM, LRESULT, RECT, WPARAM};
+use windows::Win32::Foundation::{
+    COLORREF, E_FAIL, HWND, LPARAM, LRESULT, POINT, RECT, SIZE, WPARAM,
+};
 use windows::Win32::Graphics::Direct2D::Common::{
-    D2D_RECT_F, D2D_SIZE_U, D2D1_ALPHA_MODE_PREMULTIPLIED, D2D1_COLOR_F, D2D1_PIXEL_FORMAT,
+    D2D_RECT_F, D2D1_ALPHA_MODE_PREMULTIPLIED, D2D1_COLOR_F, D2D1_PIXEL_FORMAT,
 };
 use windows::Win32::Graphics::Direct2D::{
     D2D1_ANTIALIAS_MODE_PER_PRIMITIVE, D2D1_DRAW_TEXT_OPTIONS_NONE,
-    D2D1_FACTORY_TYPE_SINGLE_THREADED, D2D1_HWND_RENDER_TARGET_PROPERTIES,
-    D2D1_PRESENT_OPTIONS_NONE, D2D1_RENDER_TARGET_PROPERTIES, D2D1_ROUNDED_RECT, D2D1CreateFactory,
-    ID2D1Factory, ID2D1HwndRenderTarget, ID2D1RenderTarget, ID2D1SolidColorBrush,
+    D2D1_FACTORY_TYPE_SINGLE_THREADED, D2D1_RENDER_TARGET_PROPERTIES, D2D1_ROUNDED_RECT,
+    D2D1_TEXT_ANTIALIAS_MODE_GRAYSCALE, D2D1CreateFactory, ID2D1DCRenderTarget, ID2D1Factory,
+    ID2D1RenderTarget, ID2D1SolidColorBrush,
 };
 use windows::Win32::Graphics::DirectWrite::{
-    DWRITE_FACTORY_TYPE_SHARED, DWRITE_FONT_STRETCH_NORMAL, DWRITE_FONT_STYLE_NORMAL,
-    DWRITE_FONT_WEIGHT_NORMAL, DWRITE_TEXT_METRICS, DWRITE_TEXT_RANGE, DWRITE_WORD_WRAPPING_WRAP,
-    DWriteCreateFactory, IDWriteFactory, IDWriteTextFormat, IDWriteTextLayout,
+    DWRITE_FACTORY_TYPE_ISOLATED, DWRITE_FONT_STRETCH_NORMAL, DWRITE_FONT_STYLE_NORMAL,
+    DWRITE_FONT_WEIGHT_NORMAL, DWRITE_LINE_SPACING_METHOD_UNIFORM, DWRITE_TEXT_METRICS,
+    DWRITE_TEXT_RANGE, DWRITE_WORD_WRAPPING_WRAP, DWriteCreateFactory, IDWriteFactory,
+    IDWriteFactory5, IDWriteFontCollection, IDWriteInMemoryFontFileLoader, IDWriteTextFormat,
+    IDWriteTextLayout,
 };
 use windows::Win32::Graphics::Dxgi::Common::DXGI_FORMAT_B8G8R8A8_UNORM;
 use windows::Win32::Graphics::Gdi::{
-    BeginPaint, CreateRoundRectRgn, DeleteObject, EndPaint, PAINTSTRUCT, SetWindowRgn, ValidateRect,
+    AC_SRC_ALPHA, AC_SRC_OVER, BI_RGB, BITMAPINFO, BITMAPINFOHEADER, BLENDFUNCTION, BeginPaint,
+    CreateCompatibleDC, CreateDIBSection, DIB_RGB_COLORS, DeleteDC, DeleteObject, EndPaint,
+    HBITMAP, HDC, PAINTSTRUCT, SelectObject, ValidateRect,
 };
 use windows::Win32::System::LibraryLoader::GetModuleHandleW;
 use windows::Win32::UI::HiDpi::GetDpiForWindow;
 use windows::Win32::UI::WindowsAndMessaging::{
-    CreateWindowExW, DefWindowProcW, HTTRANSPARENT, HWND_TOPMOST, LWA_ALPHA, MA_NOACTIVATE,
-    PostMessageW, RegisterClassW, SPI_GETWORKAREA, SW_HIDE, SWP_NOACTIVATE, SWP_SHOWWINDOW,
-    SYSTEM_PARAMETERS_INFO_UPDATE_FLAGS, SetLayeredWindowAttributes, SetWindowPos, ShowWindow,
-    SystemParametersInfoW, WM_APP, WM_MOUSEACTIVATE, WM_NCHITTEST, WM_PAINT, WNDCLASSW,
+    CreateWindowExW, DefWindowProcW, HTTRANSPARENT, HWND_TOPMOST, MA_NOACTIVATE, PostMessageW,
+    RegisterClassW, SPI_GETWORKAREA, SW_HIDE, SWP_NOACTIVATE, SWP_SHOWWINDOW,
+    SYSTEM_PARAMETERS_INFO_UPDATE_FLAGS, SetWindowPos, ShowWindow, SystemParametersInfoW,
+    ULW_ALPHA, UpdateLayeredWindow, WM_APP, WM_MOUSEACTIVATE, WM_NCHITTEST, WM_PAINT, WNDCLASSW,
     WS_EX_LAYERED, WS_EX_NOACTIVATE, WS_EX_TOOLWINDOW, WS_EX_TOPMOST, WS_EX_TRANSPARENT, WS_POPUP,
 };
 use windows::core::{Error, Interface, Result, w};
@@ -60,8 +66,102 @@ pub enum Status {
 }
 
 struct Resources {
-    target: ID2D1HwndRenderTarget,
+    target: ID2D1DCRenderTarget,
     brushes: Brushes,
+    surface: LayerBitmap,
+}
+
+struct LayerBitmap {
+    dc: HDC,
+    bitmap: HBITMAP,
+    #[cfg(test)]
+    bits: *const u8,
+}
+
+impl LayerBitmap {
+    fn new(width: i32, height: i32) -> Result<Self> {
+        let info = BITMAPINFO {
+            bmiHeader: BITMAPINFOHEADER {
+                biSize: std::mem::size_of::<BITMAPINFOHEADER>() as u32,
+                biWidth: width,
+                biHeight: -height,
+                biPlanes: 1,
+                biBitCount: 32,
+                biCompression: BI_RGB.0,
+                ..Default::default()
+            },
+            ..Default::default()
+        };
+        unsafe {
+            let mut bits = std::ptr::null_mut();
+            let bitmap = CreateDIBSection(None, &info, DIB_RGB_COLORS, &mut bits, None, 0)?;
+            let dc = CreateCompatibleDC(None);
+            if dc.is_invalid() || SelectObject(dc, bitmap.into()).is_invalid() {
+                let error = Error::from_thread();
+                if !dc.is_invalid() {
+                    let _ = DeleteDC(dc);
+                }
+                let _ = DeleteObject(bitmap.into());
+                return Err(error);
+            }
+            Ok(Self {
+                dc,
+                bitmap,
+                #[cfg(test)]
+                bits: bits.cast(),
+            })
+        }
+    }
+}
+
+impl Drop for LayerBitmap {
+    fn drop(&mut self) {
+        unsafe {
+            let _ = DeleteDC(self.dc);
+            let _ = DeleteObject(self.bitmap.into());
+        }
+    }
+}
+
+struct PadFont {
+    factory: IDWriteFactory5,
+    loader: IDWriteInMemoryFontFileLoader,
+}
+
+impl PadFont {
+    fn new(factory: &IDWriteFactory) -> Result<Self> {
+        unsafe {
+            let factory: IDWriteFactory5 = factory.cast()?;
+            let loader = factory.CreateInMemoryFontFileLoader()?;
+            factory.RegisterFontFileLoader(&loader)?;
+            Ok(Self { factory, loader })
+        }
+    }
+
+    fn collection(&self) -> Result<IDWriteFontCollection> {
+        let data = include_bytes!("../assets/fonts/DejaVuSans.ttf");
+        unsafe {
+            let file = self.loader.CreateInMemoryFontFileReference(
+                &self.factory,
+                data.as_ptr().cast(),
+                data.len() as u32,
+                None,
+            )?;
+            let builder = self.factory.CreateFontSetBuilder()?;
+            builder.AddFontFile(&file)?;
+            self.factory
+                .CreateFontCollectionFromFontSet(&builder.CreateFontSet()?)?
+                .cast()
+        }
+    }
+}
+
+impl Drop for PadFont {
+    fn drop(&mut self) {
+        unsafe {
+            let _ = self.factory.UnregisterFontFileLoader(&self.loader);
+        }
+    }
 }
 
 /// The brushes of one render target.
@@ -94,38 +194,44 @@ struct Graphics {
     dwrite: IDWriteFactory,
     text_format: IDWriteTextFormat,
     status_format: IDWriteTextFormat,
+    _font: PadFont,
 }
 
 impl Graphics {
     fn new() -> Result<Graphics> {
         unsafe {
             let d2d: ID2D1Factory = D2D1CreateFactory(D2D1_FACTORY_TYPE_SINGLE_THREADED, None)?;
-            let dwrite: IDWriteFactory = DWriteCreateFactory(DWRITE_FACTORY_TYPE_SHARED)?;
+            let dwrite: IDWriteFactory = DWriteCreateFactory(DWRITE_FACTORY_TYPE_ISOLATED)?;
+            let font = PadFont::new(&dwrite)?;
+            let collection = font.collection()?;
             let text_format = dwrite.CreateTextFormat(
-                w!("Segoe UI"),
-                None,
+                w!("DejaVu Sans"),
+                &collection,
                 DWRITE_FONT_WEIGHT_NORMAL,
                 DWRITE_FONT_STYLE_NORMAL,
                 DWRITE_FONT_STRETCH_NORMAL,
                 DRAFT_SIZE as f32,
                 w!("en-us"),
             )?;
+            text_format.SetLineSpacing(DWRITE_LINE_SPACING_METHOD_UNIFORM, 21.0, 16.0)?;
             text_format.SetWordWrapping(DWRITE_WORD_WRAPPING_WRAP)?;
             let status_format = dwrite.CreateTextFormat(
-                w!("Segoe UI"),
-                None,
+                w!("DejaVu Sans"),
+                &collection,
                 DWRITE_FONT_WEIGHT_NORMAL,
                 DWRITE_FONT_STYLE_NORMAL,
                 DWRITE_FONT_STRETCH_NORMAL,
                 STATUS_SIZE as f32,
                 w!("en-us"),
             )?;
+            status_format.SetLineSpacing(DWRITE_LINE_SPACING_METHOD_UNIFORM, 15.0, 12.0)?;
             status_format.SetWordWrapping(DWRITE_WORD_WRAPPING_WRAP)?;
             Ok(Graphics {
                 d2d,
                 dwrite,
                 text_format,
                 status_format,
+                _font: font,
             })
         }
     }
@@ -147,7 +253,6 @@ pub struct ScratchPad {
     visible: bool,
     /// Current size in pixels.
     size: (i32, i32),
-    region_size: Option<(i32, i32, i32)>,
 }
 
 impl ScratchPad {
@@ -181,7 +286,6 @@ impl ScratchPad {
                 Some(instance.into()),
                 None,
             )?;
-            SetLayeredWindowAttributes(hwnd, COLORREF(0), 255, LWA_ALPHA)?;
 
             Ok(ScratchPad {
                 hwnd,
@@ -195,7 +299,6 @@ impl ScratchPad {
                 meter: PeakMeter::default(),
                 visible: false,
                 size: (0, 0),
-                region_size: None,
             })
         }
     }
@@ -274,20 +377,6 @@ impl ScratchPad {
         };
         let width = (self.width_dip * scale).round() as i32;
         let height = (height_dip * scale).round() as i32;
-        let diameter = (2.0 * CORNER_RADIUS as f32 * scale).round() as i32;
-        if self.region_size != Some((width, height, diameter)) {
-            // A layered HWND uses whole-window opacity. Clip its opaque surface to the panel.
-            unsafe {
-                let region = CreateRoundRectRgn(0, 0, width + 1, height + 1, diameter, diameter);
-                if !region.is_invalid() {
-                    if SetWindowRgn(self.hwnd, Some(region), false) == 0 {
-                        let _ = DeleteObject(region.into());
-                    } else {
-                        self.region_size = Some((width, height, diameter));
-                    }
-                }
-            }
-        }
         let (cx, bottom) = self.anchor.unwrap_or_else(|| default_anchor(scale));
         unsafe {
             let _ = SetWindowPos(
@@ -302,14 +391,7 @@ impl ScratchPad {
         }
         if self.size != (width, height) {
             self.size = (width, height);
-            if let Some(r) = &self.resources {
-                unsafe {
-                    let _ = r.target.Resize(&D2D_SIZE_U {
-                        width: width as u32,
-                        height: height as u32,
-                    });
-                }
-            }
+            self.resources = None;
         }
         self.invalidate();
     }
@@ -326,28 +408,31 @@ impl ScratchPad {
         let dpi = self.dpi();
         let g = self.graphics()?;
         unsafe {
-            let target = g.d2d.CreateHwndRenderTarget(
-                &D2D1_RENDER_TARGET_PROPERTIES {
-                    pixelFormat: D2D1_PIXEL_FORMAT {
-                        format: DXGI_FORMAT_B8G8R8A8_UNORM,
-                        alphaMode: D2D1_ALPHA_MODE_PREMULTIPLIED,
-                    },
-                    dpiX: dpi,
-                    dpiY: dpi,
-                    ..Default::default()
+            let (width, height) = self.size;
+            let surface = LayerBitmap::new(width, height)?;
+            let target = g.d2d.CreateDCRenderTarget(&D2D1_RENDER_TARGET_PROPERTIES {
+                pixelFormat: D2D1_PIXEL_FORMAT {
+                    format: DXGI_FORMAT_B8G8R8A8_UNORM,
+                    alphaMode: D2D1_ALPHA_MODE_PREMULTIPLIED,
                 },
-                &D2D1_HWND_RENDER_TARGET_PROPERTIES {
-                    hwnd: self.hwnd,
-                    pixelSize: D2D_SIZE_U {
-                        width: self.size.0.max(1) as u32,
-                        height: self.size.1.max(1) as u32,
-                    },
-                    presentOptions: D2D1_PRESENT_OPTIONS_NONE,
+                dpiX: dpi,
+                dpiY: dpi,
+                ..Default::default()
+            })?;
+            target.BindDC(
+                surface.dc,
+                &RECT {
+                    left: 0,
+                    top: 0,
+                    right: width,
+                    bottom: height,
                 },
             )?;
+            target.SetTextAntialiasMode(D2D1_TEXT_ANTIALIAS_MODE_GRAYSCALE);
             Ok(Resources {
                 brushes: Brushes::new(&target)?,
                 target,
+                surface,
             })
         }
     }
@@ -393,7 +478,7 @@ impl ScratchPad {
             // The target keeps the DPI from its creation; the window can be on a different screen now.
             r.target.SetDpi(dpi, dpi);
             r.target.BeginDraw();
-            r.target.Clear(Some(&rgb_color(OUTLINE)));
+            r.target.Clear(Some(&D2D1_COLOR_F::default()));
             let result = draw_pad(
                 &r.target,
                 &r.brushes,
@@ -405,7 +490,27 @@ impl ScratchPad {
                 height,
             );
             let end = r.target.EndDraw(None, None);
-            result.and(end)
+            result.and(end)?;
+            // Preserve the fractional alpha at the edge when Windows composites the panel.
+            UpdateLayeredWindow(
+                self.hwnd,
+                None,
+                None,
+                Some(&SIZE {
+                    cx: self.size.0,
+                    cy: self.size.1,
+                }),
+                Some(r.surface.dc),
+                Some(&POINT::default()),
+                COLORREF(0),
+                Some(&BLENDFUNCTION {
+                    BlendOp: AC_SRC_OVER as u8,
+                    BlendFlags: 0,
+                    SourceConstantAlpha: 255,
+                    AlphaFormat: AC_SRC_ALPHA as u8,
+                }),
+                ULW_ALPHA,
+            )
         }
     }
 }
@@ -486,18 +591,24 @@ fn draw_pad(
     height: f32,
 ) -> Result<()> {
     unsafe {
-        let panel = D2D1_ROUNDED_RECT {
-            rect: rect(
-                BORDER as f32 / 2.0,
-                BORDER as f32 / 2.0,
-                width - BORDER as f32 / 2.0,
-                height - BORDER as f32 / 2.0,
-            ),
-            radiusX: CORNER_RADIUS as f32 - BORDER as f32 / 2.0,
-            radiusY: CORNER_RADIUS as f32 - BORDER as f32 / 2.0,
-        };
-        target.FillRoundedRectangle(&panel, &r.background);
-        target.DrawRoundedRectangle(&panel, &r.outline, BORDER as f32, None);
+        let radius = CORNER_RADIUS as f32;
+        let border = BORDER as f32;
+        target.FillRoundedRectangle(
+            &D2D1_ROUNDED_RECT {
+                rect: rect(0.0, 0.0, width, height),
+                radiusX: radius,
+                radiusY: radius,
+            },
+            &r.outline,
+        );
+        target.FillRoundedRectangle(
+            &D2D1_ROUNDED_RECT {
+                rect: rect(border, border, width - border, height - border),
+                radiusX: radius - border,
+                radiusY: radius - border,
+            },
+            &r.background,
+        );
 
         let width = text_width(status, width);
         let status_layout = text_layout(g, status.label(), &g.status_format, width)?;
@@ -783,10 +894,9 @@ pub mod offscreen {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use windows::Win32::Graphics::Gdi::{CreateRectRgn, GetWindowRgn, PtInRegion};
 
     #[test]
-    fn native_window_clips_the_corners_and_keeps_the_edges() {
+    fn native_surface_has_transparent_corners_and_an_antialiased_border() {
         let mut pad = ScratchPad::new(None, 320).expect("create Scratch Pad");
         pad.show(Status::Listening);
         for view in [
@@ -797,23 +907,27 @@ mod tests {
             },
         ] {
             pad.set_draft(view);
+            pad.paint();
             let (width, height) = pad.size;
-            unsafe {
-                let region = CreateRectRgn(0, 0, 0, 0);
-                assert!(!region.is_invalid());
-                let kind = GetWindowRgn(pad.hwnd, region);
-                let points = [
-                    (0, 0),
-                    (width - 1, height - 1),
-                    (width / 2, 0),
-                    (width / 2, height - 1),
-                    (width - 1, height / 2),
-                ];
-                let inside = points.map(|(x, y)| PtInRegion(region, x, y).as_bool());
-                let _ = DeleteObject(region.into());
-                assert_ne!(kind.0, 0, "the window must have a clipping region");
-                assert_eq!(inside, [false, false, true, true, true]);
-            }
+            let surface = &pad
+                .resources
+                .as_ref()
+                .expect("draw the native surface")
+                .surface;
+            let pixels =
+                unsafe { std::slice::from_raw_parts(surface.bits, (width * height * 4) as usize) };
+            let pixel = |x, y| {
+                let start = ((y * width + x) * 4) as usize;
+                &pixels[start..start + 4]
+            };
+            assert_eq!(pixel(0, 0), [0, 0, 0, 0]);
+            assert_eq!(pixel(width - 1, height - 1), [0, 0, 0, 0]);
+            assert_eq!(pixel(width / 2, 0), [0x3d, 0x34, 0x34, 255]);
+            assert_eq!(pixel(width / 2, height - 1), [0x3d, 0x34, 0x34, 255]);
+            assert!(
+                (0..12).any(|y| (0..12).any(|x| (1..255).contains(&pixel(x, y)[3]))),
+                "the rounded edge must contain partially transparent pixels"
+            );
         }
         pad.hide();
         unsafe {
