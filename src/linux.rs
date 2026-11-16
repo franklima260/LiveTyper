@@ -1,6 +1,8 @@
 //! KDE Wayland integration for the shared dictation engine, with an XWayland fallback for GNOME.
 
 mod pad;
+mod paste;
+pub mod portal;
 
 use std::cell::RefCell;
 use std::io::Write;
@@ -68,7 +70,8 @@ struct App {
 pub fn run(settings: Settings, warning: Option<String>) -> Result<(), String> {
     // Without read access to the keyboards, the Talk Key comes from the GlobalShortcuts portal,
     // which needs LiveTyper in its own systemd scope. Move there before the app registers.
-    if !hotkey::keyboard_readable(&settings.talk_key) {
+    let keyboard_readable = hotkey::keyboard_readable(&settings.talk_key);
+    if !keyboard_readable {
         hotkey::start_in_app_scope(APP_ID)?;
     }
     gtk4::init().map_err(|e| e.to_string())?;
@@ -97,11 +100,19 @@ pub fn run(settings: Settings, warning: Option<String>) -> Result<(), String> {
         return Ok(());
     }
 
+    let pad = ScratchPad::new(&application, settings.scratch_pad_width);
+    if !keyboard_readable {
+        // The desktop's window can open behind other windows.
+        pad.show(Status::Message(
+            "Allow LiveTyper's Talk Key in the desktop's window (GNOME: \"Add Keyboard Shortcuts\").",
+        ));
+    }
     let (sender, receiver) = mpsc::channel();
     let keys = sender.clone();
     let hotkeys = Hotkeys::new(&settings.talk_key, move |event| {
         let _ = keys.send(Message::Key(event, Instant::now()));
     })?;
+    pad.hide();
 
     let microphone = sender.clone();
     let keep_open = match settings.microphone_open {
@@ -131,7 +142,7 @@ pub fn run(settings: Settings, warning: Option<String>) -> Result<(), String> {
 
     let now = Instant::now();
     let mut app = App {
-        pad: ScratchPad::new(&application, settings.scratch_pad_width),
+        pad,
         dictation: Dictation::new(Duration::from_millis(settings.min_hold_ms.into())),
         settings,
         hotkeys,
@@ -455,7 +466,24 @@ impl App {
             if self.dictation.next() == Next::None {
                 self.hotkeys.set_escape(false);
             }
-            if pending
+            if pastes_through_portal() && copy_to_x11_clipboard(&pending.text) {
+                if paste::needs_permission() {
+                    self.show_message(
+                        "To paste, GNOME asks once: turn on \"Allow Remote Interaction\", then click Share.",
+                    );
+                }
+                let sender = self.sender.clone();
+                thread::spawn(move || {
+                    let event = match paste::paste() {
+                        Ok(()) => Message::OutputDone,
+                        Err(error) => {
+                            log::warn!("the RemoteDesktop portal could not paste: {error}");
+                            Message::OutputFailed(pending.text)
+                        }
+                    };
+                    let _ = sender.send(event);
+                });
+            } else if pending
                 .text
                 .bytes()
                 .all(|c| c.is_ascii_graphic() || c == b' ')
@@ -611,6 +639,15 @@ fn copy_to_x11_clipboard(text: &str) -> bool {
 
 fn is_x11() -> bool {
     gdk::Display::default().is_some_and(|display| display.is::<X11Display>())
+}
+
+// On XWayland LiveTyper owns the clipboard without focus, so without ydotool it can paste
+// through the RemoteDesktop portal.
+fn pastes_through_portal() -> bool {
+    is_x11()
+        && !std::env::var_os("PATH").is_some_and(|path| {
+            std::env::split_paths(&path).any(|dir| dir.join("ydotool").is_file())
+        })
 }
 
 #[cfg(test)]

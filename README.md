@@ -140,7 +140,7 @@ On GNOME, automatic keyboard insertion requires the active input source to be En
 
 ### Without the input group (GNOME 48 or newer)
 
-The `input` group lets every program of your account read your keystrokes. Without it, LiveTyper asks the desktop for the Talk Key through the GlobalShortcuts portal, and sees no other keys. Then skip steps 2 and 3 above: LiveTyper copies each Dictation to the clipboard and prompts you to paste it.
+The `input` group lets every program of your account read your keystrokes. Without it, LiveTyper asks the desktop for the Talk Key through the GlobalShortcuts portal, and sees no other keys. Then skip steps 2 and 3 above, and do not install ydotool: LiveTyper pastes each Dictation with Ctrl+V through the RemoteDesktop portal. The first time, GNOME asks: turn on "Allow Remote Interaction" and click Share. GNOME remembers it. In a terminal, Ctrl+V does not paste, so push Ctrl+Shift+V. If you do not allow it, LiveTyper copies each Dictation to the clipboard and prompts you to paste it.
 
 1. Install the app and its desktop file. The portal knows LiveTyper by this file, so `Exec` must be the full path of the app:
 

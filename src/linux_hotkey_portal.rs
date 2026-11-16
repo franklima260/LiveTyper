@@ -2,20 +2,17 @@
 //! owns the key, so LiveTyper needs no access to /dev/input and sees no other keys.
 
 use std::cell::RefCell;
-use std::collections::HashMap;
 use std::os::unix::process::CommandExt;
 use std::process::Command;
 use std::rc::Rc;
-use std::sync::atomic::{AtomicU32, Ordering};
 use std::time::{Duration, Instant};
 
 use global_hotkey::hotkey::{HotKey, Modifiers};
 use gtk4::{gio, glib, prelude::*};
 
 use super::KeyEvent;
+use crate::linux::portal::{PORTAL_PATH, close_session, create_session, options, request};
 
-const PORTAL: &str = "org.freedesktop.portal.Desktop";
-const PORTAL_PATH: &str = "/org/freedesktop/portal/desktop";
 const SHORTCUTS: &str = "org.freedesktop.portal.GlobalShortcuts";
 const TALK: &str = "talk";
 /// Quiet time after the last repeat of the shortcut that counts as its release.
@@ -54,25 +51,15 @@ impl PortalKey {
     pub fn bind(talk_key: &str, on_event: impl Fn(KeyEvent) + 'static) -> Result<Self, String> {
         let connection = gio::bus_get_sync(gio::BusType::Session, gio::Cancellable::NONE)
             .map_err(|e| e.to_string())?;
-        let session = request(&connection, "CreateSession", |token| {
-            (options([
-                ("handle_token", token.to_variant()),
-                ("session_handle_token", token.to_variant()),
-            ]),)
-                .to_variant()
-        })?
-        .get("session_handle")
-        .and_then(|handle| handle.str().map(str::to_owned))
-        .ok_or("the portal returned no session")?;
+        let session_path = create_session(&connection, SHORTCUTS)?;
+        let session = session_path.as_str().to_owned();
 
         let mut shortcut = options([("description", "Talk Key: hold it and speak".to_variant())]);
         if let Some(trigger) = trigger(talk_key) {
             shortcut.insert("preferred_trigger".into(), trigger.to_variant());
         }
         log::info!("asking the desktop for the Talk Key ({talk_key})");
-        let session_path =
-            glib::variant::ObjectPath::try_from(session.clone()).map_err(|e| e.to_string())?;
-        let bound = request(&connection, "BindShortcuts", |token| {
+        let bound = request(&connection, SHORTCUTS, "BindShortcuts", |token| {
             (
                 session_path,
                 vec![(TALK.to_owned(), shortcut)],
@@ -139,80 +126,7 @@ impl Drop for PortalKey {
         if let Some(source) = self.release_check.take() {
             source.remove();
         }
-        let _ = self.connection.call_sync(
-            Some(PORTAL),
-            &self.session,
-            "org.freedesktop.portal.Session",
-            "Close",
-            None,
-            None,
-            gio::DBusCallFlags::NONE,
-            1000,
-            gio::Cancellable::NONE,
-        );
-    }
-}
-
-fn options<const N: usize>(entries: [(&str, glib::Variant); N]) -> HashMap<String, glib::Variant> {
-    entries
-        .into_iter()
-        .map(|(key, value)| (key.to_owned(), value))
-        .collect()
-}
-
-/// Calls a portal method and waits for its Request::Response signal.
-fn request(
-    connection: &gio::DBusConnection,
-    method: &str,
-    args: impl FnOnce(&str) -> glib::Variant,
-) -> Result<HashMap<String, glib::Variant>, String> {
-    static NEXT: AtomicU32 = AtomicU32::new(0);
-    let token = format!("livetyper{}", NEXT.fetch_add(1, Ordering::Relaxed));
-    let sender = connection
-        .unique_name()
-        .ok_or("no D-Bus name")?
-        .trim_start_matches(':')
-        .replace('.', "_");
-    let path = format!("{PORTAL_PATH}/request/{sender}/{token}");
-    let answer = Rc::new(RefCell::new(None));
-    let _response = {
-        let answer = answer.clone();
-        connection.subscribe_to_signal(
-            None,
-            Some("org.freedesktop.portal.Request"),
-            Some("Response"),
-            Some(&path),
-            None,
-            gio::DBusSignalFlags::NONE,
-            move |signal| {
-                *answer.borrow_mut() = signal
-                    .parameters
-                    .get::<(u32, HashMap<String, glib::Variant>)>();
-            },
-        )
-    };
-    connection
-        .call_sync(
-            Some(PORTAL),
-            PORTAL_PATH,
-            SHORTCUTS,
-            method,
-            Some(&args(&token)),
-            None,
-            gio::DBusCallFlags::NONE,
-            -1,
-            gio::Cancellable::NONE,
-        )
-        .map_err(|e| e.to_string())?;
-    let context = glib::MainContext::default();
-    while answer.borrow().is_none() {
-        context.iteration(true);
-    }
-    match answer.take() {
-        Some((0, results)) => Ok(results),
-        Some((1, _)) => Err("cancelled".into()),
-        Some((code, _)) => Err(format!("failed with code {code}")),
-        None => unreachable!(),
+        close_session(&self.connection, &self.session);
     }
 }
 
