@@ -1,9 +1,10 @@
-//! KDE Wayland integration for the shared dictation engine.
+//! KDE Wayland integration for the shared dictation engine, with an XWayland fallback for GNOME.
 
 mod pad;
 
 use std::cell::RefCell;
 use std::io::Write;
+use std::os::unix::process::CommandExt;
 use std::process::{Command, Stdio};
 use std::rc::Rc;
 use std::sync::Arc;
@@ -11,7 +12,8 @@ use std::sync::mpsc::{self, Sender};
 use std::thread;
 use std::time::{Duration, Instant};
 
-use gtk4::{gio, glib, prelude::*};
+use gdk4_x11::X11Display;
+use gtk4::{gdk, gio, glib, prelude::*};
 
 use crate::audio::{AudioBuffer, Capture, KeepOpen, SAMPLE_RATE};
 use crate::dictation::{Action, Dictation, Event, Next, State, insertion_text};
@@ -64,8 +66,21 @@ struct App {
 
 pub fn run(settings: Settings, warning: Option<String>) -> Result<(), String> {
     gtk4::init().map_err(|e| e.to_string())?;
-    if !gtk4_layer_shell::is_supported() {
-        return Err("LiveTyper needs a Wayland compositor with layer-shell support.".into());
+    if !is_x11() && !gtk4_layer_shell::is_supported() {
+        // GNOME has no layer shell. Start again on XWayland, where the Scratch Pad is an
+        // override-redirect window.
+        if std::env::var_os("DISPLAY").is_some() {
+            log::info!("no layer shell: restarting on XWayland");
+            let exe = std::env::current_exe().map_err(|e| e.to_string())?;
+            let error = Command::new(exe)
+                .args(std::env::args_os().skip(1))
+                .env("GDK_BACKEND", "x11")
+                .exec();
+            return Err(error.to_string());
+        }
+        return Err(
+            "LiveTyper needs a Wayland compositor with layer-shell support, or XWayland.".into(),
+        );
     }
 
     let application = gtk4::Application::builder()
@@ -391,7 +406,8 @@ impl App {
         let copied = self
             .session_bus
             .as_ref()
-            .is_some_and(|bus| copy_to_plasma_clipboard(bus, text));
+            .is_some_and(|bus| copy_to_plasma_clipboard(bus, text))
+            || copy_to_x11_clipboard(text);
         self.step(Event::PasteDone);
         if self.dictation.state() == State::Idle {
             if copied {
@@ -506,8 +522,38 @@ fn is_plain_us_layout((short_name, _, long_name): &(String, String, String)) -> 
     short_name == "us" && long_name == "English (US)"
 }
 
+// GNOME keeps its input sources in GSettings. Only ask there on GNOME: other desktops can
+// have stale values.
+fn gnome_uses_us_layout() -> Option<bool> {
+    let desktop = std::env::var("XDG_CURRENT_DESKTOP").ok()?;
+    if !desktop.split(':').any(|name| name == "GNOME") {
+        return None;
+    }
+    let schema =
+        gio::SettingsSchemaSource::default()?.lookup("org.gnome.desktop.input-sources", true)?;
+    if !schema.has_key("mru-sources") {
+        return None;
+    }
+    let settings = gio::Settings::new_full(&schema, None::<&gio::SettingsBackend>, None);
+    let sources = settings.get::<Vec<(String, String)>>("sources");
+    let recent = settings.get::<Vec<(String, String)>>("mru-sources");
+    let (kind, id) = active_gnome_source(&sources, &recent)?;
+    Some(kind == "xkb" && id == "us")
+}
+
+fn active_gnome_source<'a>(
+    sources: &'a [(String, String)],
+    recent: &[(String, String)],
+) -> Option<&'a (String, String)> {
+    // GNOME Shell moves the active source to the front of mru-sources.
+    recent
+        .iter()
+        .find_map(|used| sources.iter().find(|source| *source == used))
+        .or(sources.first())
+}
+
 fn type_text(text: &str, bus: Option<&gio::DBusConnection>) -> std::io::Result<()> {
-    if bus.and_then(uses_us_layout) != Some(true) {
+    if bus.and_then(uses_us_layout).or_else(gnome_uses_us_layout) != Some(true) {
         return Err(std::io::Error::other(
             "the active keyboard layout is not plain US",
         ));
@@ -550,9 +596,22 @@ fn copy_to_plasma_clipboard(bus: &gio::DBusConnection, text: &str) -> bool {
     .is_ok()
 }
 
+// An X11 client owns the clipboard without focus. GNOME passes it on to Wayland apps.
+fn copy_to_x11_clipboard(text: &str) -> bool {
+    let Some(display) = gdk::Display::default().filter(|display| display.is::<X11Display>()) else {
+        return false;
+    };
+    display.clipboard().set_text(text);
+    true
+}
+
+fn is_x11() -> bool {
+    gdk::Display::default().is_some_and(|display| display.is::<X11Display>())
+}
+
 #[cfg(test)]
 mod tests {
-    use super::is_plain_us_layout;
+    use super::{active_gnome_source, is_plain_us_layout};
 
     #[test]
     fn kde_layout_check_uses_the_long_name_and_ignores_the_display_name() {
@@ -571,5 +630,22 @@ mod tests {
             "English (US)".into(),
             "English (UK)".into(),
         )));
+    }
+
+    #[test]
+    fn gnome_layout_check_uses_the_most_recent_configured_source() {
+        let source = |id: &str| ("xkb".to_owned(), id.to_owned());
+        let sources = [source("us"), source("de")];
+        assert_eq!(
+            active_gnome_source(&sources, &[source("de"), source("us")]),
+            Some(&source("de"))
+        );
+        // A source removed from the list stays in mru-sources until the next switch.
+        assert_eq!(
+            active_gnome_source(&sources, &[source("fr"), source("us")]),
+            Some(&source("us"))
+        );
+        assert_eq!(active_gnome_source(&sources, &[]), Some(&source("us")));
+        assert_eq!(active_gnome_source(&[], &[source("us")]), None);
     }
 }

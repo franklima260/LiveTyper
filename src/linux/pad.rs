@@ -1,8 +1,9 @@
-//! A non-activating, click-through Scratch Pad for KDE Wayland.
+//! A non-activating, click-through Scratch Pad for KDE Wayland, or for XWayland on GNOME.
 
 use std::cell::RefCell;
 use std::rc::Rc;
 
+use gdk4_x11::{X11Display, X11Monitor, X11Surface, x11::xlib};
 use gtk4::{glib, pango, prelude::*};
 use gtk4_layer_shell::{Edge, KeyboardMode, Layer, LayerShell};
 
@@ -34,12 +35,16 @@ impl ScratchPad {
             .resizable(false)
             .focusable(false)
             .build();
-        window.init_layer_shell();
-        window.set_layer(Layer::Overlay);
-        window.set_keyboard_mode(KeyboardMode::None);
-        window.set_namespace(Some("livetyper-scratch-pad"));
-        window.set_anchor(Edge::Bottom, true);
-        window.set_margin(Edge::Bottom, BOTTOM_MARGIN as i32);
+        if gtk4::prelude::WidgetExt::display(&window).is::<X11Display>() {
+            window.connect_realize(init_override_redirect);
+        } else {
+            window.init_layer_shell();
+            window.set_layer(Layer::Overlay);
+            window.set_keyboard_mode(KeyboardMode::None);
+            window.set_namespace(Some("livetyper-scratch-pad"));
+            window.set_anchor(Edge::Bottom, true);
+            window.set_margin(Edge::Bottom, BOTTOM_MARGIN as i32);
+        }
         window.connect_realize(|window| {
             if let Some(surface) = window.surface() {
                 surface.set_input_region(Some(&gtk4::cairo::Region::create()));
@@ -190,4 +195,45 @@ impl ScratchPad {
             self.meter.queue_draw();
         }
     }
+}
+
+// GNOME has no layer shell. An override-redirect window stays above the other windows and
+// never takes the focus. The window manager does not place it, so LiveTyper does.
+fn init_override_redirect(window: &gtk4::ApplicationWindow) {
+    let Some(surface) = window.surface().and_downcast::<X11Surface>() else {
+        return;
+    };
+    let xlib = match xlib::Xlib::open() {
+        Ok(xlib) => xlib,
+        Err(error) => {
+            log::error!("Scratch Pad: {error}");
+            return;
+        }
+    };
+    let display = surface.display().downcast::<X11Display>().unwrap();
+    unsafe {
+        let mut attributes: xlib::XSetWindowAttributes = std::mem::zeroed();
+        attributes.override_redirect = xlib::True;
+        (xlib.XChangeWindowAttributes)(
+            display.xdisplay(),
+            surface.xid(),
+            xlib::CWOverrideRedirect,
+            &mut attributes,
+        );
+    }
+    // Bottom center of the work area, like the layer-shell anchor. Keep the bottom edge in
+    // place when the Draft makes the Scratch Pad taller.
+    surface.connect_layout(move |surface, width, height| {
+        let Ok(monitor) = display.primary_monitor().downcast::<X11Monitor>() else {
+            return;
+        };
+        let area = monitor.workarea();
+        let scale = surface.scale_factor();
+        let x = area.x() + (area.width() - width) / 2;
+        let y = area.y() + area.height() - BOTTOM_MARGIN as i32 - height;
+        unsafe {
+            (xlib.XMoveWindow)(display.xdisplay(), surface.xid(), x * scale, y * scale);
+            (xlib.XFlush)(display.xdisplay());
+        }
+    });
 }

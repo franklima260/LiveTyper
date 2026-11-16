@@ -1,6 +1,6 @@
 # LiveTyper
 
-LiveTyper is a local dictation app for Windows, with a KDE Wayland preview for Linux. You speak, and it types your words into any text box. It shows each word while you speak.
+LiveTyper is a local dictation app for Windows, with a KDE Wayland and GNOME preview for Linux. You speak, and it types your words into any text box. It shows each word while you speak.
 
 LiveTyper is 100% local. It makes no network connections while it runs: no cloud speech service, no telemetry and no update checks ([ADR 0001](docs/adr/0001-no-network-at-runtime.md)). The model download is a separate one-time step that you start.
 
@@ -110,6 +110,33 @@ LiveTyper uses the same Nemotron and Parakeet models on Windows and Linux. On KD
 Linux settings are in `${XDG_CONFIG_HOME:-~/.config}/livetyper/settings.toml`. Models and the log are in `${XDG_DATA_HOME:-~/.local/share}/livetyper/`. The Scratch Pad is anchored at the bottom of the screen.
 
 The preview sends basic text through ydotool to the currently focused app after the modifiers are released. Keep focus in the intended text field through insertion. For text the keyboard driver cannot enter or when the driver reports an error, LiveTyper copies the draft through Plasma’s clipboard and prompts you to paste it. Clipboard history can retain that text. Automatic keyboard insertion requires KDE to report the layout as English (US). For other layout names, including translated names, LiveTyper uses the clipboard. The Linux preview runs from the terminal and uses the desktop's shortcut handling alongside its Talk Key.
+
+## Ubuntu and GNOME
+
+GNOME has no layer shell. On GNOME, LiveTyper starts again on XWayland by itself. The Scratch Pad is then an X11 window that stays above the other windows at the bottom center of the main screen, and never takes the focus.
+
+1. Install the build tools, the libraries, and ydotool. Ubuntu 25.04 and newer have `libgtk4-layer-shell-dev`. On Ubuntu 24.04, build GTK4 Layer Shell from source, as the Linux workflow does.
+
+   ```sh
+   sudo apt install build-essential cmake pkg-config libasound2-dev libgtk-4-dev libgtk4-layer-shell-dev ydotool
+   ```
+
+   For the default Vulkan build, also install `glslc`, `libvulkan-dev` and `spirv-headers`, or build with `--no-default-features`.
+2. Add your account to the `input` group, then restart the PC. The group gives read access to the keyboard devices for the Talk Key, and the ydotool package gives it access to `/dev/uinput`.
+
+   ```sh
+   sudo usermod -aG input $USER
+   ```
+
+3. Start ydotoold with the user service of the ydotool package:
+
+   ```sh
+   systemctl --user enable --now ydotool
+   ```
+
+4. Download the models, build the app and run it as in steps 3 and 4 above.
+
+On GNOME, automatic keyboard insertion requires the active input source to be English (US). For other input sources, including IBus input methods, LiveTyper puts the draft on the clipboard and prompts you to paste it.
 
 ## Speech acceleration
 
