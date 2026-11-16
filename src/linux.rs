@@ -1,6 +1,7 @@
-//! KDE Wayland integration for the shared dictation engine.
+//! Linux desktop integration for the shared dictation engine.
 
 mod pad;
+mod portal;
 
 use std::cell::RefCell;
 use std::io::Write;
@@ -22,8 +23,10 @@ use crate::settings::{MicrophoneOpen, Settings};
 
 use pad::{ScratchPad, Status};
 
+const APP_ID: &str = "io.github.franklima260.LiveTyper";
 const FRAME: Duration = Duration::from_millis(33);
 const MODIFIER_WAIT: Duration = Duration::from_secs(3);
+const PORTAL_FOCUS_RESTORE: Duration = Duration::from_millis(350);
 
 enum Message {
     Key(KeyEvent, Instant),
@@ -31,6 +34,7 @@ enum Message {
     MicrophoneError(String),
     OutputFailed(String),
     OutputDone,
+    PortalOutputFailed { text: String, error: String },
 }
 
 struct PendingOutput {
@@ -40,7 +44,8 @@ struct PendingOutput {
 
 struct App {
     settings: Settings,
-    hotkeys: Hotkeys,
+    keyboard: Keyboard,
+    portal_output: Rc<RefCell<Option<Rc<portal::PasteSession>>>>,
     capture: Capture,
     engine: Engine,
     pad: ScratchPad,
@@ -53,6 +58,8 @@ struct App {
     final_text: Option<String>,
     output: Option<PendingOutput>,
     key_down_at: Instant,
+    recording_started_at: Instant,
+    next_recording_started_at: Instant,
     last_activity: Instant,
     models_ready: bool,
     deadline: Option<Instant>,
@@ -62,15 +69,31 @@ struct App {
     message_until: Option<Instant>,
 }
 
-pub fn run(settings: Settings, warning: Option<String>) -> Result<(), String> {
-    gtk4::init().map_err(|e| e.to_string())?;
-    if !gtk4_layer_shell::is_supported() {
-        return Err("LiveTyper needs a Wayland compositor with layer-shell support.".into());
+enum Keyboard {
+    Evdev(Hotkeys),
+    Portal { _shortcuts: portal::Shortcuts },
+}
+
+impl Keyboard {
+    fn set_escape(&self, enabled: bool) {
+        if let Self::Evdev(hotkeys) = self {
+            hotkeys.set_escape(enabled);
+        }
     }
 
-    let application = gtk4::Application::builder()
-        .application_id("io.github.franklima260.LiveTyper")
-        .build();
+    fn modifiers_released(&self) -> bool {
+        match self {
+            Self::Evdev(hotkeys) => hotkeys.modifiers_released(),
+            Self::Portal { .. } => true,
+        }
+    }
+}
+
+pub fn run(settings: Settings, warning: Option<String>) -> Result<(), String> {
+    gtk4::init().map_err(|e| e.to_string())?;
+    let layer_shell = gtk4_layer_shell::is_supported();
+
+    let application = gtk4::Application::builder().application_id(APP_ID).build();
     application
         .register(gio::Cancellable::NONE)
         .map_err(|e| e.to_string())?;
@@ -80,9 +103,29 @@ pub fn run(settings: Settings, warning: Option<String>) -> Result<(), String> {
 
     let (sender, receiver) = mpsc::channel();
     let keys = sender.clone();
-    let hotkeys = Hotkeys::new(&settings.talk_key, move |event| {
+    let on_key = move |event| {
         let _ = keys.send(Message::Key(event, Instant::now()));
-    })?;
+    };
+    let (keyboard, session_bus) = if layer_shell {
+        (
+            Keyboard::Evdev(Hotkeys::new(&settings.talk_key, on_key.clone())?),
+            application.dbus_connection(),
+        )
+    } else {
+        let trigger = crate::hotkey::Chord::parse(&settings.talk_key)?.portal_trigger();
+        let (bus, shortcuts) = glib::MainContext::default().block_on(async {
+            let bus = portal::connect(APP_ID).await?;
+            let shortcuts = portal::Shortcuts::new(&bus, &trigger, on_key.clone()).await?;
+            Ok::<_, String>((bus, shortcuts))
+        })?;
+        log::info!("Talk Key uses the desktop Global Shortcuts portal");
+        (
+            Keyboard::Portal {
+                _shortcuts: shortcuts,
+            },
+            Some(bus),
+        )
+    };
 
     let microphone = sender.clone();
     let keep_open = match settings.microphone_open {
@@ -112,20 +155,28 @@ pub fn run(settings: Settings, warning: Option<String>) -> Result<(), String> {
 
     let now = Instant::now();
     let mut app = App {
-        pad: ScratchPad::new(&application, settings.scratch_pad_width),
+        pad: ScratchPad::new(
+            &application,
+            settings.scratch_pad_width,
+            layer_shell,
+            on_key,
+        ),
         dictation: Dictation::new(Duration::from_millis(settings.min_hold_ms.into())),
         settings,
-        hotkeys,
+        keyboard,
+        portal_output: Rc::default(),
         capture,
         engine,
         sender,
-        session_bus: application.dbus_connection(),
+        session_bus,
         generation: 0,
         audio: None,
         view: DraftView::default(),
         final_text: None,
         output: None,
         key_down_at: now,
+        recording_started_at: now,
+        next_recording_started_at: now,
         last_activity: now,
         models_ready: false,
         deadline: None,
@@ -148,6 +199,7 @@ pub fn run(settings: Settings, warning: Option<String>) -> Result<(), String> {
             app.receive(message);
         }
         app.tick();
+        app.pad.flush_overlay();
         glib::ControlFlow::Continue
     });
     main_loop.run();
@@ -156,6 +208,11 @@ pub fn run(settings: Settings, warning: Option<String>) -> Result<(), String> {
 }
 
 impl App {
+    fn set_escape(&self, enabled: bool) {
+        self.keyboard.set_escape(enabled);
+        self.pad.set_escape(enabled);
+    }
+
     fn receive(&mut self, message: Message) {
         match message {
             Message::Key(KeyEvent::TalkDown, at) => {
@@ -169,7 +226,7 @@ impl App {
             }
             Message::Key(KeyEvent::Escape, _) => {
                 if self.dictation.next() == Next::None && self.output.take().is_some() {
-                    self.hotkeys.set_escape(false);
+                    self.set_escape(false);
                     self.step(Event::PasteDone);
                 } else {
                     self.step(Event::Escape);
@@ -246,6 +303,18 @@ impl App {
             }
             Message::OutputFailed(text) => self.copy_output(&text),
             Message::OutputDone => self.step(Event::PasteDone),
+            Message::PortalOutputFailed { text, error } => {
+                log::warn!("Portal could not insert the dictation: {error}");
+                self.step(Event::PasteDone);
+                self.pad.show(Status::Message(
+                    "Automatic paste unavailable. Last dictation:",
+                ));
+                self.message_until = None;
+                self.pad.draft(&DraftView {
+                    checked: text,
+                    unchecked: String::new(),
+                });
+            }
         }
     }
 
@@ -253,6 +322,7 @@ impl App {
         match self.dictation.handle(event) {
             Action::None => {}
             Action::Start => {
+                self.recording_started_at = self.key_down_at;
                 self.start_capture();
                 self.start_engine(false);
             }
@@ -262,7 +332,7 @@ impl App {
                 self.deadline = None;
                 self.audio = None;
                 self.last_activity = Instant::now();
-                self.hotkeys.set_escape(false);
+                self.set_escape(false);
                 self.pad.hide();
             }
             Action::Finish => self.finish_capture(true),
@@ -282,7 +352,7 @@ impl App {
                 let text = insertion_text(self.final_text.take(), &self.view);
                 if text.is_empty() {
                     if self.dictation.next() == Next::None {
-                        self.hotkeys.set_escape(false);
+                        self.set_escape(false);
                     }
                     self.step(Event::PasteDone);
                 } else {
@@ -293,6 +363,7 @@ impl App {
                 }
             }
             Action::StartNext => {
+                self.next_recording_started_at = self.key_down_at;
                 self.next_released_at = None;
                 self.start_capture();
             }
@@ -300,15 +371,16 @@ impl App {
                 self.capture.stop();
                 self.audio = None;
                 if self.dictation.state() == State::Finishing {
-                    self.pad.show(Status::Finishing);
+                    self.pad.show_overlay(Status::Finishing);
                     self.pad.draft(&self.view);
                 } else {
-                    self.hotkeys.set_escape(self.output.is_some());
+                    self.set_escape(self.output.is_some());
                     self.pad.hide();
                 }
             }
             Action::FinishNext => self.finish_capture(false),
             Action::Resume { cancel, recorded } => {
+                self.recording_started_at = self.next_recording_started_at;
                 if cancel {
                     self.engine.cancel(self.generation);
                 }
@@ -319,12 +391,13 @@ impl App {
     }
 
     fn start_capture(&mut self) {
+        log::info!("Dictation recording started");
         let audio = Arc::new(AudioBuffer::default());
         self.capture.start(audio.clone());
         self.audio = Some(audio);
         self.message_until = None;
-        self.hotkeys.set_escape(true);
-        self.pad.show(if self.models_ready {
+        self.set_escape(true);
+        self.pad.show_overlay(if self.models_ready {
             Status::Listening
         } else {
             Status::Loading
@@ -349,6 +422,10 @@ impl App {
 
     fn finish_capture(&mut self, current: bool) {
         self.capture.stop();
+        log::info!(
+            "Dictation recording finished ({} ms of audio)",
+            self.audio_duration().as_millis()
+        );
         self.pad.status(Status::Finishing);
         if current {
             self.released_at = Instant::now();
@@ -408,6 +485,63 @@ impl App {
         }
     }
 
+    fn paste_with_portal(&self, text: String) {
+        let bus = self
+            .session_bus
+            .clone()
+            .expect("portal requires a session bus");
+        let shell = self.pad.shell_bus();
+        let started = self.recording_started_at;
+        let sessions = self.portal_output.clone();
+        let sender = self.sender.clone();
+        glib::spawn_future_local(async move {
+            let result = async {
+                let current = sessions.borrow().clone();
+                let session = match current {
+                    Some(session) if !session.is_closed() => session,
+                    _ => {
+                        let session = Rc::new(portal::PasteSession::new(&bus).await?);
+                        // The portal can reply before GNOME restores focus after its dialog.
+                        glib::timeout_future(PORTAL_FOCUS_RESTORE).await;
+                        sessions.replace(Some(session.clone()));
+                        session
+                    }
+                };
+                let target = if let Some(shell) = &shell {
+                    loop {
+                        match pad::paste_target(shell).await {
+                            // A second Talk Key can be held while the first take finishes.
+                            // Shift/Alt/Super would change the synthetic Ctrl+V shortcut.
+                            Some((_, true)) => {
+                                glib::timeout_future(Duration::from_millis(40)).await;
+                            }
+                            Some((0, false)) => {
+                                return Err("No GNOME window is focused for automatic paste.".into());
+                            }
+                            Some((target, false)) => break Some(target),
+                            None => break None,
+                        }
+                    }
+                } else {
+                    None
+                };
+                session.paste(&text, target, started).await
+            }
+            .await;
+            let message = match result {
+                Ok(()) => {
+                    log::info!("Dictation sent through the Remote Desktop paste portal");
+                    Message::OutputDone
+                }
+                Err(error) => {
+                    sessions.replace(None);
+                    Message::PortalOutputFailed { text, error }
+                }
+            };
+            let _ = sender.send(message);
+        });
+    }
+
     fn expire_deadline(&mut self) -> bool {
         if self.dictation.state() != State::Finishing
             || !self
@@ -430,12 +564,14 @@ impl App {
         if let Some(audio) = &self.audio {
             self.pad.update_meter(audio.level());
         }
-        if self.output.is_some() && self.hotkeys.modifiers_released() {
+        if self.output.is_some() && self.keyboard.modifiers_released() {
             let pending = self.output.take().unwrap();
             if self.dictation.next() == Next::None {
-                self.hotkeys.set_escape(false);
+                self.set_escape(false);
             }
-            if pending
+            if matches!(self.keyboard, Keyboard::Portal { .. }) {
+                self.paste_with_portal(pending.text);
+            } else if pending
                 .text
                 .bytes()
                 .all(|c| c.is_ascii_graphic() || c == b' ')
@@ -462,7 +598,7 @@ impl App {
         {
             let pending = self.output.take().unwrap();
             if self.dictation.next() == Next::None {
-                self.hotkeys.set_escape(false);
+                self.set_escape(false);
             }
             self.copy_output(&pending.text);
         }

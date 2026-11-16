@@ -111,6 +111,33 @@ Linux settings are in `${XDG_CONFIG_HOME:-~/.config}/livetyper/settings.toml`. M
 
 The preview sends basic text through ydotool to the currently focused app after the modifiers are released. Keep focus in the intended text field through insertion. For text the keyboard driver cannot enter or when the driver reports an error, LiveTyper copies the draft through Plasma’s clipboard and prompts you to paste it. Clipboard history can retain that text. Automatic keyboard insertion requires KDE to report the layout as English (US). For other layout names, including translated names, LiveTyper uses the clipboard. The Linux preview runs from the terminal and uses the desktop's shortcut handling alongside its Talk Key.
 
+## Ubuntu GNOME Wayland preview
+
+Ubuntu 26.04 uses desktop portals for the Talk Key and automatic paste. It needs neither the `input` group nor `ydotool`. Install a stable Rust toolchain first. For a CPU build, install the dependencies and desktop entry from this checkout:
+
+```sh
+sudo apt install build-essential cmake pkg-config libasound2-dev libgtk-4-dev libgtk4-layer-shell-dev fonts-dejavu-core
+bash scripts/download-models.sh
+cargo build --release --locked --no-default-features
+install -Dm755 target/release/livetyper "$HOME/.local/bin/livetyper"
+applications="${XDG_DATA_HOME:-$HOME/.local/share}/applications"
+mkdir -p "$applications"
+sed "s|^Exec=livetyper$|Exec=\"$HOME/.local/bin/livetyper\"|" \
+  data/io.github.franklima260.LiveTyper.desktop > "$applications/io.github.franklima260.LiveTyper.desktop"
+"$HOME/.local/bin/livetyper"
+```
+
+Approve the Talk Key when GNOME asks to add a global shortcut. Change an existing binding in GNOME Settings. Hold the shortcut while the intended text field has focus and release it to finalize. The first paste requests keyboard control and clipboard access for this session. LiveTyper puts the transcript on the clipboard and sends Ctrl+V. If permission is declined, a window displays the transcript so you can copy it.
+
+The live Scratch Pad uses the bundled extension for GNOME Shell 50. In the GNOME session, install it for your user:
+
+```sh
+gnome-extensions pack --force data/gnome-shell
+gnome-extensions install --force livetyper@franklima260.github.io.shell-extension.zip
+```
+
+Sign out and back in if GNOME has yet to discover the extension, then run `gnome-extensions enable livetyper@franklima260.github.io`. The Shell draws the Scratch Pad at the bottom of the display, so the target field keeps keyboard focus. Press Escape while recording or finishing to discard the dictation. The extension registers Escape with GNOME Shell only while cancellation is available. The extension also lets LiveTyper recognize follow-ups in the same window. If a follow-up starts before the previous take pastes, it records immediately. If Shift, Alt, or Super is still down, automatic paste waits for those modifiers to be released. The Talk Key and basic automatic paste also work with the extension disabled. Use an editor that accepts Ctrl+V for automatic paste.
+
 ## Speech acceleration
 
 The default build includes Vulkan. On a compatible GPU and driver the speech runtime can use Vulkan, with CPU available as a fallback. LiveTyper logs the backend selected for each model when it loads. The AVX2 build floor also applies to Vulkan builds.
@@ -184,9 +211,10 @@ The shared Dictation tests cover short taps, Escape, follow-up dictation, releas
 and fallback text selection. Run the same cases on either platform with
 `cargo test --locked --no-default-features dictation::tests`.
 
-The GTK Scratch Pad is the design reference. Both renderers use the dimensions and colors
-in `src/pad_style.rs`. When you change the design, compare the same draft on both desktops.
-Check the rounded corners, text wrap, and peak meter at normal and high display scaling.
+The GTK Scratch Pad is the design reference. The GTK and Windows renderers use the
+dimensions and colors in `src/pad_style.rs`. Keep the GNOME Shell styles in
+`data/gnome-shell/` aligned with those values. Compare the same draft on all three
+desktops and check the corners, text wrap, and peak meter at normal and high display scaling.
 
 Run the unit tests. They need no models and no microphone:
 

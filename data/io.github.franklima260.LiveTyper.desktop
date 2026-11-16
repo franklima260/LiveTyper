@@ -1,0 +1,7 @@
+[Desktop Entry]
+Type=Application
+Name=LiveTyper
+Comment=Local speech-to-text dictation
+Exec=livetyper
+Terminal=false
+Categories=Utility;Accessibility;

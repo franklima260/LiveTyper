@@ -1,14 +1,19 @@
-//! A non-activating, click-through Scratch Pad for KDE Wayland.
+//! A Scratch Pad with a non-activating overlay on layer-shell desktops.
 
-use std::cell::RefCell;
+use std::cell::{Cell, RefCell};
 use std::rc::Rc;
 
-use gtk4::{glib, pango, prelude::*};
+use gtk4::{gio, glib, pango, prelude::*};
 use gtk4_layer_shell::{Edge, KeyboardMode, Layer, LayerShell};
 
 use crate::draft::DraftView;
+use crate::hotkey::KeyEvent;
 use crate::meter::{PeakMeter, SEGMENTS};
 use crate::pad_style::*;
+
+const SHELL: &str = "org.gnome.Shell";
+const PAD_PATH: &str = "/io/github/franklima260/LiveTyper/ScratchPad";
+const PAD_INTERFACE: &str = "io.github.franklima260.LiveTyper.ScratchPad";
 
 pub enum Status<'a> {
     Listening,
@@ -23,28 +28,46 @@ pub struct ScratchPad {
     draft: gtk4::Label,
     meter: gtk4::DrawingArea,
     peak: Rc<RefCell<PeakMeter>>,
+    shell: Option<ShellPad>,
+}
+
+struct ShellPad {
+    bus: gio::DBusConnection,
+    width: u32,
+    visible: Cell<bool>,
+    cancel_enabled: Cell<bool>,
+    _cancel: gio::SignalSubscription,
+    last_update: RefCell<Option<glib::Variant>>,
 }
 
 impl ScratchPad {
-    pub fn new(application: &gtk4::Application, width: u32) -> Self {
+    pub fn new(
+        application: &gtk4::Application,
+        width: u32,
+        layer_shell: bool,
+        on_key: impl Fn(KeyEvent) + 'static,
+    ) -> Self {
         let window = gtk4::ApplicationWindow::builder()
             .application(application)
             .default_width(width.clamp(280, 1920) as i32)
-            .decorated(false)
+            .title("LiveTyper")
+            .decorated(!layer_shell)
             .resizable(false)
             .focusable(false)
             .build();
-        window.init_layer_shell();
-        window.set_layer(Layer::Overlay);
-        window.set_keyboard_mode(KeyboardMode::None);
-        window.set_namespace(Some("livetyper-scratch-pad"));
-        window.set_anchor(Edge::Bottom, true);
-        window.set_margin(Edge::Bottom, BOTTOM_MARGIN as i32);
-        window.connect_realize(|window| {
-            if let Some(surface) = window.surface() {
-                surface.set_input_region(Some(&gtk4::cairo::Region::create()));
-            }
-        });
+        if layer_shell {
+            window.init_layer_shell();
+            window.set_layer(Layer::Overlay);
+            window.set_keyboard_mode(KeyboardMode::None);
+            window.set_namespace(Some("livetyper-scratch-pad"));
+            window.set_anchor(Edge::Bottom, true);
+            window.set_margin(Edge::Bottom, BOTTOM_MARGIN as i32);
+            window.connect_realize(|window| {
+                if let Some(surface) = window.surface() {
+                    surface.set_input_region(Some(&gtk4::cairo::Region::create()));
+                }
+            });
+        }
 
         let panel = gtk4::Box::new(gtk4::Orientation::Horizontal, METER_GAP as i32);
         panel.add_css_class("livetyper-panel");
@@ -76,6 +99,7 @@ impl ScratchPad {
         draft.add_css_class("livetyper-draft");
         draft.set_xalign(0.0);
         draft.set_wrap(true);
+        draft.set_selectable(!layer_shell);
         draft.set_wrap_mode(pango::WrapMode::WordChar);
         draft.set_max_width_chars(64);
         draft.set_visible(false);
@@ -136,6 +160,26 @@ impl ScratchPad {
             draft,
             meter,
             peak,
+            shell: if layer_shell {
+                None
+            } else {
+                application.dbus_connection().map(|bus| ShellPad {
+                    width: width.clamp(280, 1920),
+                    visible: Cell::new(false),
+                    cancel_enabled: Cell::new(false),
+                    _cancel: bus.subscribe_to_signal(
+                        Some(SHELL),
+                        Some(PAD_INTERFACE),
+                        Some("Cancel"),
+                        Some(PAD_PATH),
+                        None,
+                        gio::DBusSignalFlags::NONE,
+                        move |_| on_key(KeyEvent::Escape),
+                    ),
+                    last_update: RefCell::new(None),
+                    bus,
+                })
+            },
         }
     }
 
@@ -146,15 +190,35 @@ impl ScratchPad {
         });
     }
 
+    pub fn show_overlay(&self, status: Status<'_>) {
+        if let Some(shell) = &self.shell {
+            self.window.set_visible(false);
+            self.reset(status);
+            shell.visible.set(true);
+        } else {
+            self.show(status);
+        }
+    }
+
     pub fn show(&self, status: Status<'_>) {
+        if let Some(shell) = &self.shell {
+            shell.visible.set(false);
+        }
+        self.reset(status);
+        self.window.set_visible(true);
+    }
+
+    fn reset(&self, status: Status<'_>) {
         *self.peak.borrow_mut() = PeakMeter::default();
         self.meter.queue_draw();
         self.draft.set_visible(false);
         self.status(status);
-        self.window.set_visible(true);
     }
 
     pub fn hide(&self) {
+        if let Some(shell) = &self.shell {
+            shell.visible.set(false);
+        }
         self.window.set_visible(false);
     }
 
@@ -186,8 +250,93 @@ impl ScratchPad {
     }
 
     pub fn update_meter(&self, level: f32) {
-        if self.meter.is_visible() && self.peak.borrow_mut().update(level) {
+        let visible = self.meter.is_visible()
+            || self
+                .shell
+                .as_ref()
+                .is_some_and(|shell| shell.visible.get() && self.meter.get_visible());
+        if visible && self.peak.borrow_mut().update(level) {
             self.meter.queue_draw();
         }
     }
+
+    pub fn shell_bus(&self) -> Option<gio::DBusConnection> {
+        self.shell.as_ref().map(|shell| shell.bus.clone())
+    }
+
+    pub fn set_escape(&self, enabled: bool) {
+        if let Some(shell) = &self.shell {
+            shell.cancel_enabled.set(enabled);
+        }
+    }
+
+    pub fn flush_overlay(&self) {
+        let Some(shell) = &self.shell else { return };
+        let visible = shell.visible.get();
+        let frame = if visible {
+            let draft = if self.draft.get_visible() {
+                self.draft.label()
+            } else {
+                glib::GString::default()
+            };
+            let segments: Vec<_> = self
+                .peak
+                .borrow()
+                .segments()
+                .map(|segment| {
+                    let [red, green, blue] = segment.color.map(f64::from);
+                    (segment.lit, segment.held, red, green, blue)
+                })
+                .collect();
+            (
+                true,
+                self.status.text().as_str(),
+                draft.as_str(),
+                self.meter.get_visible(),
+                shell.width,
+                segments,
+                shell.cancel_enabled.get(),
+            )
+                .to_variant()
+        } else {
+            (
+                false,
+                "",
+                "",
+                false,
+                shell.width,
+                Vec::<(bool, bool, f64, f64, f64)>::new(),
+                shell.cancel_enabled.get(),
+            )
+                .to_variant()
+        };
+        if shell.last_update.borrow().as_ref() != Some(&frame) {
+            if let Err(error) = shell.bus.emit_signal(
+                Some(SHELL),
+                PAD_PATH,
+                PAD_INTERFACE,
+                "Changed",
+                Some(&frame),
+            ) {
+                log::warn!("GNOME Scratch Pad: {error}");
+            }
+            shell.last_update.replace(Some(frame));
+        }
+    }
+}
+
+pub async fn paste_target(bus: &gio::DBusConnection) -> Option<(u32, bool)> {
+    bus.call_future(
+        Some(SHELL),
+        PAD_PATH,
+        PAD_INTERFACE,
+        "GetPasteTarget",
+        None,
+        None,
+        gio::DBusCallFlags::NO_AUTO_START,
+        1000,
+    )
+    .await
+    .ok()?
+    .get()
 }

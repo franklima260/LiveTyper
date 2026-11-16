@@ -1,0 +1,7 @@
+{
+  "uuid": "livetyper@franklima260.github.io",
+  "name": "LiveTyper Scratch Pad",
+  "description": "Shows the LiveTyper draft and microphone meter without taking keyboard focus.",
+  "shell-version": ["50"],
+  "url": "https://github.com/franklima260/LiveTyper"
+}

@@ -788,6 +788,7 @@ version = "0.1.0"
 dependencies = [
  "cpal",
  "evdev",
+ "futures-util",
  "global-hotkey",
  "gtk4",
  "gtk4-layer-shell",

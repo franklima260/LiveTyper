@@ -52,6 +52,42 @@ impl Chord {
         }
         Ok(Self { key, modifiers })
     }
+    pub fn portal_trigger(&self) -> String {
+        let mut parts = Vec::new();
+        for (bit, name) in [
+            (CTRL, "CTRL"),
+            (SHIFT, "SHIFT"),
+            (ALT, "ALT"),
+            (SUPER, "LOGO"),
+        ] {
+            if self.modifiers & bit != 0 {
+                parts.push(name);
+            }
+        }
+        let key_name = format!("{:?}", self.key);
+        let key = match self.key {
+            KeyCode::KEY_SPACE => "space",
+            KeyCode::KEY_ENTER => "Return",
+            KeyCode::KEY_ESC => "Escape",
+            KeyCode::KEY_BACKSPACE => "BackSpace",
+            KeyCode::KEY_PAGEUP => "Page_Up",
+            KeyCode::KEY_PAGEDOWN => "Page_Down",
+            KeyCode::KEY_MINUS => "minus",
+            KeyCode::KEY_EQUAL => "equal",
+            KeyCode::KEY_COMMA => "comma",
+            KeyCode::KEY_DOT => "period",
+            KeyCode::KEY_SLASH => "slash",
+            KeyCode::KEY_BACKSLASH => "backslash",
+            KeyCode::KEY_LEFTBRACE => "bracketleft",
+            KeyCode::KEY_RIGHTBRACE => "bracketright",
+            KeyCode::KEY_SEMICOLON => "semicolon",
+            KeyCode::KEY_APOSTROPHE => "apostrophe",
+            KeyCode::KEY_GRAVE => "grave",
+            _ => key_name.trim_start_matches("KEY_"),
+        };
+        parts.push(key);
+        parts.join("+")
+    }
 }
 
 fn linux_key(name: &str) -> Option<KeyCode> {

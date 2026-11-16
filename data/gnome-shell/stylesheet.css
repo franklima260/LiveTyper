@@ -1,0 +1,11 @@
+.livetyper-panel {
+    background-color: #17171c;
+    border: 1px solid #34343d;
+    border-radius: 14px;
+    padding: 12px 16px;
+    spacing: 16px;
+    font-family: "DejaVu Sans", sans-serif;
+}
+.livetyper-text { spacing: 7px; }
+.livetyper-status { color: #d9d9df; font-size: 12px; }
+.livetyper-draft { color: #f5f5f6; font-size: 17px; }
