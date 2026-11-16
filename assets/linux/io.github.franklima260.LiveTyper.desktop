@@ -1,0 +1,9 @@
+[Desktop Entry]
+Type=Application
+Name=LiveTyper
+Comment=Local dictation: hold the Talk Key and speak
+Exec=livetyper
+Icon=audio-input-microphone
+Terminal=false
+Categories=Utility;Accessibility;
+StartupNotify=false

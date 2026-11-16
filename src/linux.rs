@@ -19,11 +19,12 @@ use crate::audio::{AudioBuffer, Capture, KeepOpen, SAMPLE_RATE};
 use crate::dictation::{Action, Dictation, Event, Next, State, insertion_text};
 use crate::draft::DraftView;
 use crate::engine::{Engine, EngineConfig, EngineEvent};
-use crate::hotkey::{Hotkeys, KeyEvent};
+use crate::hotkey::{self, Hotkeys, KeyEvent};
 use crate::settings::{MicrophoneOpen, Settings};
 
 use pad::{ScratchPad, Status};
 
+const APP_ID: &str = "io.github.franklima260.LiveTyper";
 const FRAME: Duration = Duration::from_millis(33);
 const MODIFIER_WAIT: Duration = Duration::from_secs(3);
 
@@ -65,6 +66,11 @@ struct App {
 }
 
 pub fn run(settings: Settings, warning: Option<String>) -> Result<(), String> {
+    // Without read access to the keyboards, the Talk Key comes from the GlobalShortcuts portal,
+    // which needs LiveTyper in its own systemd scope. Move there before the app registers.
+    if !hotkey::keyboard_readable(&settings.talk_key) {
+        hotkey::start_in_app_scope(APP_ID)?;
+    }
     gtk4::init().map_err(|e| e.to_string())?;
     if !is_x11() && !gtk4_layer_shell::is_supported() {
         // GNOME has no layer shell. Start again on XWayland, where the Scratch Pad is an
@@ -83,9 +89,7 @@ pub fn run(settings: Settings, warning: Option<String>) -> Result<(), String> {
         );
     }
 
-    let application = gtk4::Application::builder()
-        .application_id("io.github.franklima260.LiveTyper")
-        .build();
+    let application = gtk4::Application::builder().application_id(APP_ID).build();
     application
         .register(gio::Cancellable::NONE)
         .map_err(|e| e.to_string())?;

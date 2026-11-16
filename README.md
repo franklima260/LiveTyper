@@ -138,6 +138,22 @@ GNOME has no layer shell. On GNOME, LiveTyper starts again on XWayland by itself
 
 On GNOME, automatic keyboard insertion requires the active input source to be English (US). For other input sources, including IBus input methods, LiveTyper puts the draft on the clipboard and prompts you to paste it.
 
+### Without the input group (GNOME 48 or newer)
+
+The `input` group lets every program of your account read your keystrokes. Without it, LiveTyper asks the desktop for the Talk Key through the GlobalShortcuts portal, and sees no other keys. Then skip steps 2 and 3 above: LiveTyper copies each Dictation to the clipboard and prompts you to paste it.
+
+1. Install the app and its desktop file. The portal knows LiveTyper by this file, so `Exec` must be the full path of the app:
+
+   ```sh
+   install -Dm755 target/release/livetyper ~/.local/bin/livetyper
+   sed "s|^Exec=.*|Exec=$HOME/.local/bin/livetyper|" assets/linux/io.github.franklima260.LiveTyper.desktop \
+       >~/.local/share/applications/io.github.franklima260.LiveTyper.desktop
+   ```
+
+2. Start LiveTyper from Activities. The first time, GNOME asks you to allow the Talk Key. It suggests `talk_key`, and you can choose another key there. To start LiveTyper when you sign in, copy the desktop file to `~/.config/autostart/`.
+
+GNOME owns the Talk Key, so the focused app does not get it. GNOME reports the release of a single key such as F9, but not of a chord such as Ctrl+Space. For a chord, LiveTyper takes the end of the key repeats as the release, so keep key repeat on (Settings > Accessibility > Typing > Repeat Keys). Escape does not cancel a Dictation in this mode.
+
 ## Speech acceleration
 
 The default build includes Vulkan. On a compatible GPU and driver the speech runtime can use Vulkan, with CPU available as a fallback. LiveTyper logs the backend selected for each model when it loads. The AVX2 build floor also applies to Vulkan builds.

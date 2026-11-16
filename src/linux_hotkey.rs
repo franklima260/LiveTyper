@@ -1,4 +1,10 @@
 //! Observe the Talk Key on physical keyboards without grabbing them from the compositor.
+//! Without read access to the keyboards, the Talk Key comes from the GlobalShortcuts portal.
+
+#[path = "linux_hotkey_portal.rs"]
+mod portal;
+
+pub use portal::start_in_app_scope;
 
 use std::collections::{HashMap, HashSet};
 use std::io;
@@ -98,6 +104,7 @@ struct Signals {
 pub struct Hotkeys {
     signals: Arc<Signals>,
     listener: Option<JoinHandle<()>>,
+    _portal: Option<portal::PortalKey>,
 }
 
 impl Hotkeys {
@@ -109,7 +116,14 @@ impl Hotkeys {
         let mut keyboards = HashMap::new();
         scan_keyboards(&mut keyboards, chord);
         if keyboards.is_empty() {
-            return Err("No readable physical keyboard in /dev/input. Check the keyboard device permissions.".into());
+            let portal = portal::PortalKey::bind(talk_key, on_event).map_err(|e| {
+                format!("No readable physical keyboard in /dev/input, and the GlobalShortcuts portal gave no Talk Key: {e}")
+            })?;
+            return Ok(Self {
+                signals: Arc::default(),
+                listener: None,
+                _portal: Some(portal),
+            });
         }
 
         let signals = Arc::new(Signals::default());
@@ -124,6 +138,7 @@ impl Hotkeys {
         Ok(Self {
             signals,
             listener: Some(listener),
+            _portal: None,
         })
     }
 
@@ -150,32 +165,31 @@ struct Keyboard {
     held: HashSet<KeyCode>,
 }
 
+/// Whether LiveTyper can read a physical keyboard. Otherwise the Talk Key comes from the portal.
+pub fn keyboard_readable(talk_key: &str) -> bool {
+    let Ok(chord) = Chord::parse(talk_key) else {
+        return true;
+    };
+    let Ok(entries) = std::fs::read_dir("/dev/input") else {
+        return false;
+    };
+    entries
+        .flatten()
+        .any(|entry| open_keyboard(&entry.path(), chord).is_some())
+}
+
 fn scan_keyboards(keyboards: &mut HashMap<PathBuf, Keyboard>, chord: Chord) {
     let Ok(entries) = std::fs::read_dir("/dev/input") else {
         return;
     };
     for entry in entries.flatten() {
         let path = entry.path();
-        if keyboards.contains_key(&path) || !physical_event_device(&path) {
+        if keyboards.contains_key(&path) {
             continue;
         }
-        let Ok(device) = Device::open(&path) else {
+        let Some((device, name)) = open_keyboard(&path, chord) else {
             continue;
         };
-        let name = device.name().unwrap_or_default().to_ascii_lowercase();
-        if ["dotool", "wtype", "xdotool"]
-            .iter()
-            .any(|tool| name.contains(tool))
-        {
-            continue;
-        }
-        let is_keyboard = device.supported_keys().is_some_and(|keys| {
-            keys.contains(chord.key)
-                || keys.contains(KeyCode::KEY_A) && keys.contains(KeyCode::KEY_Z)
-        });
-        if !is_keyboard || device.set_nonblocking(true).is_err() {
-            continue;
-        }
         let held = device
             .get_key_state()
             .map(|keys| keys.iter().filter(|&key| modifier(key) != 0).collect())
@@ -183,6 +197,27 @@ fn scan_keyboards(keyboards: &mut HashMap<PathBuf, Keyboard>, chord: Chord) {
         log::info!("Talk Key observes {} ({})", path.display(), name);
         keyboards.insert(path, Keyboard { device, held });
     }
+}
+
+fn open_keyboard(path: &Path, chord: Chord) -> Option<(Device, String)> {
+    if !physical_event_device(path) {
+        return None;
+    }
+    let device = Device::open(path).ok()?;
+    let name = device.name().unwrap_or_default().to_ascii_lowercase();
+    if ["dotool", "wtype", "xdotool"]
+        .iter()
+        .any(|tool| name.contains(tool))
+    {
+        return None;
+    }
+    let is_keyboard = device.supported_keys().is_some_and(|keys| {
+        keys.contains(chord.key) || keys.contains(KeyCode::KEY_A) && keys.contains(KeyCode::KEY_Z)
+    });
+    if !is_keyboard || device.set_nonblocking(true).is_err() {
+        return None;
+    }
+    Some((device, name))
 }
 
 fn physical_event_device(path: &Path) -> bool {
