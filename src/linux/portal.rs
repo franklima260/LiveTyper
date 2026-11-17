@@ -282,7 +282,6 @@ pub struct PasteSession {
     session: Session,
     closed: Rc<Cell<bool>>,
     selection: Rc<RefCell<Selection>>,
-    last_paste: Cell<Option<(u32, Instant)>>,
     _closed_signal: gio::SignalSubscription,
     _transfer: gio::SignalSubscription,
 }
@@ -290,8 +289,14 @@ pub struct PasteSession {
 impl PasteSession {
     pub async fn new(bus: &gio::DBusConnection) -> Result<Self, String> {
         let session = Session::create(bus, REMOTE).await?;
+        let token_file = crate::paths::local_dir().join("gnome-paste-token");
+        let restore_token = std::fs::read_to_string(&token_file).ok();
         request(bus, REMOTE, "SelectDevices", |mut options| {
             options.insert("types", 1u32.to_variant()); // Keyboard
+            options.insert("persist_mode", 2u32.to_variant()); // Until revoked
+            if let Some(token) = &restore_token {
+                options.insert("restore_token", token.to_variant());
+            }
             (&session.path, options).to_variant()
         })
         .await?;
@@ -306,6 +311,25 @@ impl PasteSession {
             (&session.path, "", options).to_variant()
         })
         .await?;
+        // Restore tokens are single-use. Store the replacement before the paste,
+        // even if the target later rejects the clipboard transfer.
+        if let Some(token) = granted.get("restore_token").and_then(glib::Variant::str) {
+            let file = gio::File::for_path(&token_file);
+            if let Err(error) = file.replace_contents(
+                token.as_bytes(),
+                None,
+                false,
+                gio::FileCreateFlags::PRIVATE | gio::FileCreateFlags::REPLACE_DESTINATION,
+                gio::Cancellable::NONE,
+            ) {
+                log::warn!("Could not remember GNOME paste permission: {error}");
+            }
+        } else if restore_token.is_some()
+            && let Err(error) = std::fs::remove_file(&token_file)
+            && error.kind() != std::io::ErrorKind::NotFound
+        {
+            log::warn!("Could not remove the expired GNOME paste token: {error}");
+        }
         if granted
             .get("devices")
             .and_then(glib::Variant::get::<u32>)
@@ -380,7 +404,6 @@ impl PasteSession {
             session,
             closed,
             selection,
-            last_paste: Cell::new(None),
             _closed_signal: closed_signal,
             _transfer: transfer,
         })
@@ -395,9 +418,11 @@ impl PasteSession {
         text: &str,
         target: Option<u32>,
         started: Instant,
+        last_paste: Option<(u32, Instant)>,
+        verify_focus: impl Future<Output = Result<(), String>>,
     ) -> Result<(), String> {
         let Session { bus, path } = &self.session;
-        let follow_up = target.zip(self.last_paste.get()).is_some_and(|(target, (last, at))| {
+        let follow_up = target.zip(last_paste).is_some_and(|(target, (last, at))| {
             target == last && started.saturating_duration_since(at) < Duration::from_secs(30)
         });
         let text = if follow_up && needs_space_before(text) {
@@ -406,7 +431,10 @@ impl PasteSession {
             text.to_owned()
         };
         let received = Rc::new(Cell::new(false));
-        self.selection.replace(Selection { text, received: received.clone() });
+        self.selection.replace(Selection {
+            text,
+            received: received.clone(),
+        });
         call(
             bus,
             CLIPBOARD,
@@ -414,6 +442,11 @@ impl PasteSession {
             (path, Options::from([("mime_types", [TEXT].to_variant())])).to_variant(),
         )
         .await?;
+
+        // The selection is registered before the target receives the Wayland
+        // clipboard offer. Give it time to process the offer before Ctrl+V.
+        glib::timeout_future(Duration::from_millis(50)).await;
+        verify_focus.await?;
 
         // Evdev keycodes for left Ctrl and V, emitted by the compositor.
         let mut result = Ok(());
@@ -440,7 +473,9 @@ impl PasteSession {
         if !received.get() {
             return Err("The target did not request the dictated text.".into());
         }
-        self.last_paste.set(target.map(|target| (target, Instant::now())));
+        // A clipboard manager can request the selection before the editor.
+        // Keep serving requests briefly after the first successful transfer.
+        glib::timeout_future(Duration::from_millis(150)).await;
         Ok(())
     }
 }

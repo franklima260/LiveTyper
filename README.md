@@ -111,32 +111,37 @@ Linux settings are in `${XDG_CONFIG_HOME:-~/.config}/livetyper/settings.toml`. M
 
 The preview sends basic text through ydotool to the currently focused app after the modifiers are released. Keep focus in the intended text field through insertion. For text the keyboard driver cannot enter or when the driver reports an error, LiveTyper copies the draft through Plasma’s clipboard and prompts you to paste it. Clipboard history can retain that text. Automatic keyboard insertion requires KDE to report the layout as English (US). For other layout names, including translated names, LiveTyper uses the clipboard. The Linux preview runs from the terminal and uses the desktop's shortcut handling alongside its Talk Key.
 
-## Ubuntu GNOME Wayland preview
+## Ubuntu 26.04 GNOME (Wayland)
 
-Ubuntu 26.04 uses desktop portals for the Talk Key and automatic paste. It needs neither the `input` group nor `ydotool`. Install a stable Rust toolchain first. For a CPU build, install the dependencies and desktop entry from this checkout:
-
-```sh
-sudo apt install build-essential cmake pkg-config libasound2-dev libgtk-4-dev libgtk4-layer-shell-dev fonts-dejavu-core
-bash scripts/download-models.sh
-cargo build --release --locked --no-default-features
-install -Dm755 target/release/livetyper "$HOME/.local/bin/livetyper"
-applications="${XDG_DATA_HOME:-$HOME/.local/share}/applications"
-mkdir -p "$applications"
-sed "s|^Exec=livetyper$|Exec=\"$HOME/.local/bin/livetyper\"|" \
-  data/io.github.franklima260.LiveTyper.desktop > "$applications/io.github.franklima260.LiveTyper.desktop"
-"$HOME/.local/bin/livetyper"
-```
-
-Approve the Talk Key when GNOME asks to add a global shortcut. Change an existing binding in GNOME Settings. Hold the shortcut while the intended text field has focus and release it to finalize. The first paste requests keyboard control and clipboard access for this session. LiveTyper puts the transcript on the clipboard and sends Ctrl+V. If permission is declined, a window displays the transcript so you can copy it.
-
-The live Scratch Pad uses the bundled extension for GNOME Shell 50. In the GNOME session, install it for your user:
+The amd64 Ubuntu package includes LiveTyper and the Scratch Pad extension for GNOME Shell 50. Install the package and download the speech models as your regular user:
 
 ```sh
-gnome-extensions pack --force data/gnome-shell
-gnome-extensions install --force livetyper@franklima260.github.io.shell-extension.zip
+sudo apt install ./livetyper_0.1.0_amd64.deb
+livetyper-download-models
 ```
 
-Sign out and back in if GNOME has yet to discover the extension, then run `gnome-extensions enable livetyper@franklima260.github.io`. The Shell draws the Scratch Pad at the bottom of the display, so the target field keeps keyboard focus. Press Escape while recording or finishing to discard the dictation. The extension registers Escape with GNOME Shell only while cancellation is available. The extension also lets LiveTyper recognize follow-ups in the same window. If a follow-up starts before the previous take pastes, it records immediately. If Shift, Alt, or Super is still down, automatic paste waits for those modifiers to be released. The Talk Key and basic automatic paste also work with the extension disabled. Use an editor that accepts Ctrl+V for automatic paste.
+Sign out and back in so GNOME discovers the extension, then enable it and open **LiveTyper** from the app menu:
+
+```sh
+gnome-extensions enable livetyper@franklima260.github.io
+```
+
+The Talk Key and automatic paste use desktop portals. You do not need the `input` group or `ydotool`. With up to four logical CPUs, the GNOME path uses one Recast thread by default to leave CPU capacity for other apps. Set a positive `recast_threads` in your LiveTyper settings to override it.
+
+Approve the Talk Key when GNOME asks to add a global shortcut. Change an existing binding in GNOME Settings. Hold the shortcut while the intended text field has focus and release it to finalize.
+
+On the first paste, GNOME asks for keyboard control and clipboard access. In that dialog, turn on **Allow Remote Interaction**, leave **Allow Clipboard Access** on, then click **Share**. Leave **Remember This Selection** checked to reuse the permission on later pastes, including after restarting LiveTyper. LiveTyper opens the session to put the transcript on the clipboard and send Ctrl+V, then closes it after the transfer. GNOME may briefly show a remote-control indicator. If you decline, LiveTyper displays the transcript so you can copy it.
+
+The Shell draws the Scratch Pad at the bottom of the display, so the target field keeps keyboard focus. Press Escape while recording or finishing to discard the dictation. The extension registers Escape with GNOME Shell only while cancellation is available. The extension also lets LiveTyper recognize follow-ups in the same window. If a follow-up starts before the previous take pastes, it records immediately. If Shift, Alt, or Super is still down, automatic paste waits for those modifiers to be released. The Talk Key and basic automatic paste also work with the extension disabled. Use an editor that accepts Ctrl+V for automatic paste.
+
+To build the package on Ubuntu 26.04 amd64 with a stable Rust toolchain:
+
+```sh
+sudo apt install build-essential cmake pkg-config libasound2-dev libgtk-4-dev libgtk4-layer-shell-dev
+scripts/build-ubuntu-deb.sh
+```
+
+The CPU package is written to `dist/`. Build it on Ubuntu 26.04 to match the libraries on the target system.
 
 ## Speech acceleration
 

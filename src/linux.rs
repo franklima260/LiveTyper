@@ -3,7 +3,7 @@
 mod pad;
 mod portal;
 
-use std::cell::RefCell;
+use std::cell::{Cell, RefCell};
 use std::io::Write;
 use std::process::{Command, Stdio};
 use std::rc::Rc;
@@ -26,7 +26,9 @@ use pad::{ScratchPad, Status};
 const APP_ID: &str = "io.github.franklima260.LiveTyper";
 const FRAME: Duration = Duration::from_millis(33);
 const MODIFIER_WAIT: Duration = Duration::from_secs(3);
-const PORTAL_FOCUS_RESTORE: Duration = Duration::from_millis(350);
+const PORTAL_FOCUS_FALLBACK: Duration = Duration::from_millis(350);
+const PORTAL_FOCUS_TIMEOUT: Duration = Duration::from_secs(1);
+const PORTAL_FOCUS_POLL: Duration = Duration::from_millis(20);
 
 enum Message {
     Key(KeyEvent, Instant),
@@ -45,7 +47,7 @@ struct PendingOutput {
 struct App {
     settings: Settings,
     keyboard: Keyboard,
-    portal_output: Rc<RefCell<Option<Rc<portal::PasteSession>>>>,
+    last_portal_paste: Rc<Cell<Option<(u32, Instant)>>>,
     capture: Capture,
     engine: Engine,
     pad: ScratchPad,
@@ -138,6 +140,16 @@ pub fn run(settings: Settings, warning: Option<String>) -> Result<(), String> {
     let capture = Capture::new(settings.microphone.clone(), keep_open, move |message| {
         let _ = microphone.send(Message::MicrophoneError(message));
     });
+    // On small GNOME systems, leave CPU headroom for the desktop. A positive
+    // setting overrides this default, and layer-shell desktops retain automatic sizing.
+    let recast_threads = if matches!(keyboard, Keyboard::Portal { .. })
+        && settings.recast_threads == 0
+        && thread::available_parallelism().is_ok_and(|cores| cores.get() <= 4)
+    {
+        1
+    } else {
+        settings.recast_threads
+    };
     let speech = sender.clone();
     let engine = Engine::new(
         EngineConfig {
@@ -146,7 +158,7 @@ pub fn run(settings: Settings, warning: Option<String>) -> Result<(), String> {
             recast_interval: Duration::from_millis(settings.recast_interval_ms.into()),
             recast_window_ms: i64::from(settings.recast_window_s) * 1000,
             live_threads: settings.live_threads,
-            recast_threads: settings.recast_threads,
+            recast_threads,
         },
         move |event| {
             let _ = speech.send(Message::Engine(event));
@@ -164,7 +176,7 @@ pub fn run(settings: Settings, warning: Option<String>) -> Result<(), String> {
         dictation: Dictation::new(Duration::from_millis(settings.min_hold_ms.into())),
         settings,
         keyboard,
-        portal_output: Rc::default(),
+        last_portal_paste: Rc::default(),
         capture,
         engine,
         sender,
@@ -492,40 +504,62 @@ impl App {
             .expect("portal requires a session bus");
         let shell = self.pad.shell_bus();
         let started = self.recording_started_at;
-        let sessions = self.portal_output.clone();
+        let last_paste = self.last_portal_paste.clone();
         let sender = self.sender.clone();
         glib::spawn_future_local(async move {
             let result = async {
-                let current = sessions.borrow().clone();
-                let session = match current {
-                    Some(session) if !session.is_closed() => session,
-                    _ => {
-                        let session = Rc::new(portal::PasteSession::new(&bus).await?);
-                        // The portal can reply before GNOME restores focus after its dialog.
-                        glib::timeout_future(PORTAL_FOCUS_RESTORE).await;
-                        sessions.replace(Some(session.clone()));
-                        session
-                    }
-                };
-                let target = if let Some(shell) = &shell {
-                    loop {
-                        match pad::paste_target(shell).await {
-                            // A second Talk Key can be held while the first take finishes.
-                            // Shift/Alt/Super would change the synthetic Ctrl+V shortcut.
-                            Some((_, true)) => {
-                                glib::timeout_future(Duration::from_millis(40)).await;
-                            }
-                            Some((0, false)) => {
-                                return Err("No GNOME window is focused for automatic paste.".into());
-                            }
-                            Some((target, false)) => break Some(target),
-                            None => break None,
+                // Remember which editor had focus before the portal can show its dialog.
+                let expected = if let Some(shell) = &shell {
+                    match pad::paste_target(shell).await {
+                        Some((0, _)) => {
+                            return Err("No GNOME window is focused for automatic paste.".into());
                         }
+                        Some((target, _)) => Some(target),
+                        None => None,
                     }
                 } else {
                     None
                 };
-                session.paste(&text, target, started).await
+                let session = portal::PasteSession::new(&bus).await?;
+                let target = if let (Some(shell), Some(expected)) = (&shell, expected) {
+                    let started_waiting = Instant::now();
+                    loop {
+                        let Some((current, modifiers_held)) = pad::paste_target(shell).await else {
+                            return Err("Could not verify GNOME focus for automatic paste.".into());
+                        };
+                        let elapsed = started_waiting.elapsed();
+                        if current == expected {
+                            // Shift, Alt or Super would change the synthetic Ctrl+V.
+                            if !modifiers_held {
+                                break Some(current);
+                            }
+                            if elapsed >= MODIFIER_WAIT {
+                                return Err(
+                                    "Modifiers are still held. Paste the draft manually.".into()
+                                );
+                            }
+                        } else if elapsed >= PORTAL_FOCUS_TIMEOUT {
+                            return Err("GNOME did not return focus to the original window.".into());
+                        }
+                        glib::timeout_future(PORTAL_FOCUS_POLL).await;
+                    }
+                } else {
+                    // Without the optional extension, allow GNOME time to dismiss its dialog.
+                    glib::timeout_future(PORTAL_FOCUS_FALLBACK).await;
+                    None
+                };
+                session
+                    .paste(&text, target, started, last_paste.get(), async {
+                        if let (Some(shell), Some(target)) = (&shell, target)
+                            && pad::paste_target(shell).await != Some((target, false))
+                        {
+                            return Err("Focus or modifiers changed before automatic paste.".into());
+                        }
+                        Ok(())
+                    })
+                    .await?;
+                last_paste.set(target.map(|target| (target, Instant::now())));
+                Ok(())
             }
             .await;
             let message = match result {
@@ -533,10 +567,7 @@ impl App {
                     log::info!("Dictation sent through the Remote Desktop paste portal");
                     Message::OutputDone
                 }
-                Err(error) => {
-                    sessions.replace(None);
-                    Message::PortalOutputFailed { text, error }
-                }
+                Err(error) => Message::PortalOutputFailed { text, error },
             };
             let _ = sender.send(message);
         });
