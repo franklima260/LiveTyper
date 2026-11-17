@@ -14,6 +14,9 @@ const PAD_PATH = '/io/github/franklima260/LiveTyper/ScratchPad';
 const PAD_INTERFACE = `${APP_ID}.ScratchPad`;
 const MAX_DRAFT_HEIGHT = 240;
 const PAD_XML = `<node><interface name="${PAD_INTERFACE}">
+    <method name="GetTalkControl">
+        <arg type="b" direction="out" />
+    </method>
     <method name="GetPasteTarget">
         <arg type="u" direction="out" />
         <arg type="b" direction="out" />
@@ -113,6 +116,18 @@ export default class LiveTyperScratchPad extends Extension {
         this._scroll = null;
         this._meter = null;
         this._segments = [];
+    }
+
+    GetTalkControlAsync(_parameters, invocation) {
+        if (invocation.get_sender() !== this._appOwner || Main.sessionMode.isLocked) {
+            invocation.return_dbus_error('org.freedesktop.DBus.Error.AccessDenied',
+                'Only the active LiveTyper instance may query the Talk Key.');
+            return;
+        }
+        const [, , modifiers] = global.get_pointer();
+        invocation.return_value(new GLib.Variant('(b)', [
+            Boolean(modifiers & Clutter.ModifierType.CONTROL_MASK),
+        ]));
     }
 
     GetPasteTargetAsync(_parameters, invocation) {

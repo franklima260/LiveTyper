@@ -162,14 +162,29 @@ impl Drop for Session {
 }
 
 #[derive(Default)]
-struct HeldKey(bool);
+struct HeldKey {
+    pressed: bool,
+    sequence: u64,
+}
+
+impl HeldKey {
+    fn control_released(&mut self, sequence: u64, control_held: bool) -> Option<KeyEvent> {
+        if self.sequence != sequence || control_held {
+            return None;
+        }
+        self.update(false)
+    }
+}
 
 impl HeldKey {
     fn update(&mut self, pressed: bool) -> Option<KeyEvent> {
-        if self.0 == pressed {
+        if self.pressed == pressed {
             return None;
         }
-        self.0 = pressed;
+        self.pressed = pressed;
+        if pressed {
+            self.sequence += 1;
+        }
         Some(if pressed {
             KeyEvent::TalkDown
         } else {
@@ -179,6 +194,10 @@ impl HeldKey {
 }
 
 pub struct Shortcuts {
+    held: Rc<RefCell<HeldKey>>,
+    check_control: bool,
+    control_unavailable_for: Rc<Cell<Option<u64>>>,
+    control_query: Rc<Cell<bool>>,
     _signals: gio::SignalSubscription,
     _closed: gio::SignalSubscription,
     _session: Session,
@@ -204,8 +223,7 @@ impl Shortcuts {
                 let held = held.clone();
                 let handler = handler.clone();
                 move |_| {
-                    if held.borrow_mut().0 {
-                        held.borrow_mut().0 = false;
+                    if held.borrow_mut().update(false).is_some() {
                         handler(KeyEvent::Escape);
                     }
                     log::warn!(
@@ -215,6 +233,7 @@ impl Shortcuts {
             },
         );
         let talk_session = session.path.clone();
+        let signal_held = held.clone();
         let signals = bus.subscribe_to_signal(
             Some(BUS),
             Some(SHORTCUTS),
@@ -230,7 +249,7 @@ impl Shortcuts {
                 };
                 if signal.parameters.child_get::<ObjectPath>(0) == talk_session
                     && signal.parameters.child_get::<String>(1) == TALK
-                    && let Some(event) = held.borrow_mut().update(pressed)
+                    && let Some(event) = signal_held.borrow_mut().update(pressed)
                 {
                     handler(event);
                 }
@@ -247,29 +266,77 @@ impl Shortcuts {
             (&session.path, shortcuts, "", options).to_variant()
         })
         .await?;
-        let bound = response
+        let shortcuts = response
             .get("shortcuts")
-            .and_then(|value| value.get::<Vec<(String, Results)>>())
-            .is_some_and(|shortcuts| {
-                shortcuts.iter().any(|(id, properties)| {
-                    id == TALK
-                        && properties
-                            .get("trigger_description")
-                            .and_then(glib::Variant::str)
-                            .is_some_and(|text| !text.is_empty())
-                })
-            });
-        if !bound {
+            .and_then(|value| value.get::<Vec<(String, Results)>>());
+        let binding = shortcuts.as_ref().and_then(|shortcuts| {
+            shortcuts.iter().find_map(|(id, properties)| {
+                (id == TALK)
+                    .then(|| properties.get("trigger_description")?.str())
+                    .flatten()
+                    .filter(|description| !description.is_empty())
+            })
+        });
+        let Some(binding) = binding else {
             return Err(
                 "Bind a Talk Key for LiveTyper in GNOME Settings and restart LiveTyper.".into(),
             );
-        }
+        };
         Ok(Self {
+            held,
+            check_control: is_gnome_control_space(binding),
+            control_unavailable_for: Rc::default(),
+            control_query: Rc::default(),
             _signals: signals,
             _closed: closed,
             _session: session,
         })
     }
+
+    pub fn poll_control(
+        &self,
+        shell: &gio::DBusConnection,
+        on_release: impl FnOnce(KeyEvent) + 'static,
+    ) {
+        if !self.check_control || self.control_query.get() {
+            return;
+        }
+        let sequence = {
+            let held = self.held.borrow();
+            if !held.pressed || self.control_unavailable_for.get() == Some(held.sequence) {
+                return;
+            }
+            held.sequence
+        };
+        self.control_query.set(true);
+        let shell = shell.clone();
+        let held = self.held.clone();
+        let control_unavailable_for = self.control_unavailable_for.clone();
+        let control_query = self.control_query.clone();
+        glib::spawn_future_local(async move {
+            let control = super::pad::talk_control_held(&shell).await;
+            control_query.set(false);
+            if let Some(control_held) = control {
+                if let Some(event) = held.borrow_mut().control_released(sequence, control_held) {
+                    on_release(event);
+                }
+            } else {
+                control_unavailable_for.set(Some(sequence));
+            }
+        });
+    }
+}
+
+// GNOME 50 formats a single binding as the translated "Press %s" with the
+// GTK accelerator unchanged. Match the bound key, since GNOME may have kept
+// a user's earlier binding instead of accepting our preferred trigger.
+fn is_gnome_control_space(description: &str) -> bool {
+    let mut words = description.split_whitespace();
+    words.next().is_some()
+        && words
+            .next()
+            .is_some_and(|key| key.eq_ignore_ascii_case("<Control>space"))
+        && words.next().is_none()
 }
 
 #[derive(Clone, Default)]
@@ -534,5 +601,48 @@ mod tests {
         assert_eq!(key.update(false), Some(KeyEvent::TalkUp));
         assert_eq!(key.update(false), None);
         assert_eq!(key.update(true), Some(KeyEvent::TalkDown));
+    }
+    #[test]
+    fn control_space_release_orders_end_once_with_or_without_repeats() {
+        for repeats in [0, 5] {
+            for control_first in [false, true] {
+                let mut key = HeldKey::default();
+                assert_eq!(key.update(true), Some(KeyEvent::TalkDown));
+                let press = key.sequence;
+                assert_eq!(key.control_released(press, true), None);
+                for _ in 0..repeats {
+                    assert_eq!(key.update(true), None);
+                    assert_eq!(key.control_released(press, true), None);
+                }
+                if control_first {
+                    assert_eq!(key.control_released(press, false), Some(KeyEvent::TalkUp));
+                    assert_eq!(key.update(false), None);
+                } else {
+                    assert_eq!(key.update(false), Some(KeyEvent::TalkUp));
+                    assert_eq!(key.control_released(press, false), None);
+                }
+                assert_eq!(key.update(true), Some(KeyEvent::TalkDown));
+            }
+        }
+    }
+
+    #[test]
+    fn a_stale_shell_sample_cannot_release_a_new_take() {
+        let mut key = HeldKey::default();
+        key.update(true);
+        let stale = key.sequence;
+        key.update(false);
+        key.update(true);
+        assert_eq!(key.control_released(stale, false), None);
+        assert_eq!(key.update(false), Some(KeyEvent::TalkUp));
+    }
+
+    #[test]
+    fn control_probe_is_restricted_to_the_bound_control_space_accelerator() {
+        assert!(is_gnome_control_space("Press <Control>space"));
+        assert!(is_gnome_control_space("Appuyez <Control>space"));
+        assert!(!is_gnome_control_space("Press F9"));
+        assert!(!is_gnome_control_space("Press <Shift><Control>F10"));
+        assert!(!is_gnome_control_space("Press <Control>space or F9"));
     }
 }

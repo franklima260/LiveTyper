@@ -340,3 +340,21 @@ pub async fn paste_target(bus: &gio::DBusConnection) -> Option<(u32, bool)> {
     .ok()?
     .get()
 }
+
+pub async fn talk_control_held(bus: &gio::DBusConnection) -> Option<bool> {
+    let (held,) = bus
+        .call_future(
+            Some(SHELL),
+            PAD_PATH,
+            PAD_INTERFACE,
+            "GetTalkControl",
+            None,
+            None,
+            gio::DBusCallFlags::NO_AUTO_START,
+            1000,
+        )
+        .await
+        .ok()?
+        .get::<(bool,)>()?;
+    Some(held)
+}

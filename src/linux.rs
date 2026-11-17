@@ -73,7 +73,7 @@ struct App {
 
 enum Keyboard {
     Evdev(Hotkeys),
-    Portal { _shortcuts: portal::Shortcuts },
+    Portal { shortcuts: portal::Shortcuts },
 }
 
 impl Keyboard {
@@ -121,12 +121,7 @@ pub fn run(settings: Settings, warning: Option<String>) -> Result<(), String> {
             Ok::<_, String>((bus, shortcuts))
         })?;
         log::info!("Talk Key uses the desktop Global Shortcuts portal");
-        (
-            Keyboard::Portal {
-                _shortcuts: shortcuts,
-            },
-            Some(bus),
-        )
+        (Keyboard::Portal { shortcuts }, Some(bus))
     };
 
     let microphone = sender.clone();
@@ -212,6 +207,14 @@ pub fn run(settings: Settings, warning: Option<String>) -> Result<(), String> {
         }
         app.tick();
         app.pad.flush_overlay();
+        if let Keyboard::Portal { shortcuts } = &app.keyboard
+            && let Some(shell) = app.pad.shell_bus()
+        {
+            let sender = app.sender.clone();
+            shortcuts.poll_control(&shell, move |event| {
+                let _ = sender.send(Message::Key(event, Instant::now()));
+            });
+        }
         glib::ControlFlow::Continue
     });
     main_loop.run();
