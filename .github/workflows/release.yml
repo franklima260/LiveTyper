@@ -1,0 +1,118 @@
+name: Release
+
+on:
+  push:
+    tags: ['v*']
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+jobs:
+  windows:
+    runs-on: windows-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        backend: [vulkan, cpu]
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: ilammy/msvc-dev-cmd@v1
+      - uses: jakoch/install-vulkan-sdk-action@v1.6.0
+        if: matrix.backend == 'vulkan'
+        with:
+          vulkan_version: '1.4.341.0'
+          install_runtime: true
+      - name: Configure SPIR-V headers
+        if: matrix.backend == 'vulkan'
+        shell: pwsh
+        run: |
+          foreach ($file in 'Include/vulkan/vulkan.h', 'Lib/vulkan-1.lib', 'Bin/glslc.exe') {
+            if (!(Test-Path (Join-Path $env:VULKAN_SDK $file))) {
+              throw "Missing Vulkan SDK component: $file"
+            }
+          }
+          $source = Join-Path $env:RUNNER_TEMP spirv-headers
+          $prefix = Join-Path $env:RUNNER_TEMP spirv-prefix
+          git init $source
+          git -C $source fetch --depth 1 https://github.com/KhronosGroup/SPIRV-Headers.git 6efe5ae6b7c6ad29da3f2cc3f164b9c3d72b78b1
+          git -C $source checkout FETCH_HEAD
+          cmake -S $source -B "$source/build" "-DCMAKE_INSTALL_PREFIX=$prefix"
+          cmake --install "$source/build"
+          "CMAKE_PREFIX_PATH=$prefix" >> $env:GITHUB_ENV
+          $include = (Join-Path $prefix include).Replace('\', '/')
+          "CXXFLAGS=/I`"$include`"" >> $env:GITHUB_ENV
+      - name: Test
+        shell: pwsh
+        run: |
+          $flags = @('--locked', '--all-targets')
+          if ('${{ matrix.backend }}' -eq 'cpu') { $flags += '--no-default-features' }
+          cargo test @flags
+          if ($LASTEXITCODE -ne 0) { throw 'Tests failed' }
+      - name: Build installer
+        shell: pwsh
+        run: |
+          choco install innosetup --no-progress -y
+          if ($LASTEXITCODE -ne 0) { throw 'Inno Setup installation failed' }
+          if ('${{ matrix.backend }}' -eq 'cpu') {
+            ./scripts/build-installer.ps1 -CpuOnly
+            Get-ChildItem dist/LiveTyper-Setup-*.exe | Rename-Item -NewName { $_.BaseName + '-CpuOnly.exe' }
+          } else {
+            ./scripts/build-installer.ps1
+          }
+      - uses: actions/upload-artifact@v4
+        with:
+          name: windows-${{ matrix.backend }}
+          path: dist/*.exe
+          if-no-files-found: error
+
+  linux:
+    runs-on: ubuntu-latest
+    container: ubuntu:26.04
+    steps:
+      - name: Install tools and runtime dependencies
+        run: |
+          apt-get update
+          apt-get install -y ca-certificates curl git build-essential cmake pkg-config libasound2-dev libgtk-4-dev libgtk4-layer-shell-dev fonts-dejavu-core
+          curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh -s -- -y --profile minimal
+          echo "/github/home/.cargo/bin" >> "$GITHUB_PATH"
+      - uses: actions/checkout@v4
+      - name: Test and package
+        run: |
+          export PATH="$HOME/.cargo/bin:$PATH"
+          cargo test --locked --all-targets --no-default-features
+          scripts/build-ubuntu-deb.sh
+          version=$(sed -n 's/^version = "\([^"]*\)".*/\1/p' Cargo.toml | head -n 1)
+          mkdir -p bundle
+          cp target/release/livetyper scripts/download-models.sh README.md bundle/
+          tar -czf "dist/LiveTyper-Linux-x64-$version-CpuOnly.tar.gz" -C bundle .
+      - uses: actions/upload-artifact@v4
+        with:
+          name: linux
+          path: dist/*
+          if-no-files-found: error
+
+  publish:
+    needs: [windows, linux]
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/download-artifact@v4
+        with:
+          path: release-assets
+          merge-multiple: true
+      - name: Publish tagged version
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          version=$(sed -n 's/^version = "\([^"]*\)".*/\1/p' Cargo.toml | head -n 1)
+          tag="v$version"
+          if [ "$GITHUB_REF_TYPE" = tag ] && [ "$GITHUB_REF_NAME" != "$tag" ]; then
+            echo "Tag must match Cargo.toml version" >&2
+            exit 1
+          fi
+          cd release-assets
+          sha256sum * > SHA256SUMS
+          cd ..
+          gh release create "$tag" --target "$GITHUB_SHA" --title "LiveTyper $version" --notes-file docs/release-notes.md release-assets/*
