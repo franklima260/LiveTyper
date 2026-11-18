@@ -1,6 +1,43 @@
 # LiveTyper
 
-LiveTyper is a local dictation app for Windows, with a KDE Wayland preview for Linux. You speak, and it types your words into any text box. It shows each word while you speak.
+LiveTyper turns your voice into text in the app you’re already using. Put the cursor in an editor, email, or chat, hold **Ctrl+Space**, and speak. A small **Scratch Pad** shows your words as you talk. Release the key to insert the finished text.
+
+It runs on Windows and Linux, with desktop integration for KDE Wayland and Ubuntu 26.04 GNOME.
+
+## Why LiveTyper exists
+
+LiveTyper grew out of a desire for private, local dictation with immediate feedback. You should be able to see what the app hears while you speak, let it correct the draft with more context, and insert the finished words where you’re working. Speech recognition runs on your own computer, so dictation works offline once the models are downloaded.
+
+The Scratch Pad lets you follow the draft without moving focus away from your work. New words appear in grey and checked words turn white. Press Escape to discard a take.
+
+## See it in action
+
+These screenshots show the live draft and microphone meter during desktop testing.
+
+| Windows | KDE Wayland |
+|---|---|
+| ![LiveTyper Scratch Pad while dictating on Windows](assets/screenshots/windows.png) | ![LiveTyper Scratch Pad while dictating on KDE](assets/screenshots/kde.png) |
+
+Ubuntu GNOME, shown at 200% display scaling:
+
+![LiveTyper live draft and meter on Ubuntu GNOME](assets/screenshots/ubuntu-gnome.png)
+
+## Get the current version
+
+Start with the [GitHub Releases page](https://github.com/franklima260/LiveTyper/releases) for published downloads and release notes. Choose the newest release that includes a build for your platform. If no suitable download is published yet, use the build instructions below from the current `main` branch. Test packages shared in issues can contain fixes awaiting a published release.
+
+To update a source checkout:
+
+```sh
+git switch main
+git pull --ff-only
+```
+
+Quit LiveTyper before updating. On Windows, rerun the latest installer. On Ubuntu, install the newer `.deb` with `sudo apt install ./<package-file>.deb`, then sign out and back in to reload the bundled Scratch Pad extension. If you previously installed the extension under `~/.local/share/gnome-shell/extensions/`, update that copy from the same checkout too, because it takes precedence over the packaged extension. Keep your settings and speech models when updating.
+
+## Feedback and support
+
+I’m open to feedback and will respond to issues. If something breaks, feels confusing, or could work better, please [open a GitHub issue](https://github.com/franklima260/LiveTyper/issues). Include your OS and desktop version, the LiveTyper version or commit, what you expected, and what happened. Suggestions and reports from real use help shape the project.
 
 LiveTyper is 100% local. It makes no network connections while it runs: no cloud speech service, no telemetry and no update checks ([ADR 0001](docs/adr/0001-no-network-at-runtime.md)). The model download is a separate one-time step that you start.
 
@@ -153,7 +190,7 @@ Use `cargo build --release --locked --no-default-features` for a CPU-only binary
 
 ## Model setup (one time)
 
-The setup downloads the models. Without the setup (for example, for a build from source), run this script one time:
+The Windows setup downloads the models. Ubuntu users run `livetyper-download-models`. Without the Windows setup (for example, for a build from source), run this script one time:
 
 ```
 powershell -ExecutionPolicy Bypass -File scripts\download-models.ps1
@@ -172,7 +209,7 @@ To use a different folder, add `-ModelsDir <folder>`. Then set `models_dir` in t
 
 ## Settings
 
-The settings file is `%APPDATA%\LiveTyper\settings.toml`. LiveTyper writes this file with the default values when it does not exist. To open it, use Open settings in the tray menu. Restart LiveTyper after a change.
+On Windows, the settings file is `%APPDATA%\LiveTyper\settings.toml`. On Linux it is `${XDG_CONFIG_HOME:-~/.config}/livetyper/settings.toml`. LiveTyper writes this file with the default values when it does not exist. To open it, use Open settings in the tray menu. Restart LiveTyper after a change.
 
 A key that is not in the file takes its default value. An unknown key or an incorrect value is an error. Then LiveTyper uses all default values, shows a message, and writes the error to the log.
 
@@ -193,7 +230,7 @@ A key that is not in the file takes its default value. An unknown key or an inco
 | `release_deadline_ms` | Windows `2000`, Linux `10000` | After you release the Talk Key, the maximum time to wait for the last Recast, in ms. Then LiveTyper pastes the current Draft. |
 | `min_hold_ms` | `300` | A shorter Talk Key push, in ms, does nothing. |
 | `live_threads` | `0` | CPU threads for the live model. `0` = automatic. |
-| `recast_threads` | `0` | CPU threads for the Recast model. `0` = automatic. |
+| `recast_threads` | `0` | CPU threads for the Recast model. Automatic on GNOME uses one thread on systems with up to four logical CPUs. A positive value overrides this. Other desktops use the engine’s automatic sizing. |
 | `start_with_windows` | `true` | Start LiveTyper when you sign in to Windows. |
 | `startup_method` | `"registry"` | How LiveTyper starts with Windows: `"registry"` (a `LiveTyper` value under `HKCU\Software\Microsoft\Windows\CurrentVersion\Run`) or `"startup_folder"` (a `LiveTyper.lnk` shortcut in the Startup folder). LiveTyper keeps the selected way and removes the other one. |
 
@@ -213,7 +250,7 @@ Each Dictation writes one line to the log: the audio length, where the speech st
 
 Windows and Linux CI run the default tests in both CPU-only and Vulkan builds.
 The shared Dictation tests cover short taps, Escape, follow-up dictation, release deadlines,
-and fallback text selection. Run the same cases on either platform with
+and fallback text selection. GNOME portal tests also cover both Ctrl+Space release orders, repeat events, and stale Shell responses. Run the same cases on either platform with
 `cargo test --locked --no-default-features dictation::tests`.
 
 The GTK Scratch Pad is the design reference. The GTK and Windows renderers use the

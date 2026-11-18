@@ -1,6 +1,6 @@
 # LiveTyper
 
-LiveTyper is a local Windows app. You speak, and it types your words into any text box. It shows each word while you speak.
+LiveTyper is a local dictation app for Windows and Linux. You speak, and it types your words into any text box. It shows each word while you speak.
 
 ## Language
 
