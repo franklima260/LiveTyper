@@ -24,7 +24,16 @@ Ubuntu GNOME, shown at 200% display scaling:
 
 ## Get the current version
 
-Start with the [GitHub Releases page](https://github.com/franklima260/LiveTyper/releases) for published downloads and release notes. Choose the newest release that includes a build for your platform. If no suitable download is published yet, use the build instructions below from the current `main` branch. Test packages shared in issues can contain fixes awaiting a published release.
+Download installers and packages from the [latest release](https://github.com/franklima260/LiveTyper/releases/latest). Read the release notes for platform requirements. Choose the newest release that includes a build for your platform. If no suitable download is published yet, use the build instructions below from the current `main` branch. Test packages shared in issues can contain fixes awaiting a published release.
+
+| Desktop | Download |
+|---|---|
+| Windows x64 with Vulkan | `LiveTyper-Setup-<version>.exe` |
+| Windows x64 CPU | `LiveTyper-Setup-<version>-CpuOnly.exe` |
+| Ubuntu 26.04 GNOME | `livetyper_<version>_amd64.deb` |
+| KDE Wayland on a compatible Linux distribution | `LiveTyper-Linux-x64-<version>-CpuOnly.tar.gz` |
+
+Linux release binaries need glibc 2.43+, GTK 4.22+, GTK4 Layer Shell, ALSA, and an AVX2-capable x86-64 CPU. For KDE, extract the archive, run `bash download-models.sh`, and follow the keyboard and ydotool setup below. Build from source if your distribution has older libraries. Windows installers are unsigned. The release includes `SHA256SUMS` to verify the downloaded files.
 
 To update a source checkout:
 
