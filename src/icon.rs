@@ -9,6 +9,8 @@ use windows::Win32::UI::WindowsAndMessaging::{
 };
 use windows::core::Result;
 
+use crate::icon_shape::coverage;
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum IconState {
     Idle,
@@ -39,27 +41,6 @@ impl Icons {
             IconState::Busy => self.busy,
         }
     }
-}
-
-/// Coverage 0..1 of the microphone shape at a point, in a 32×32 design grid.
-fn coverage(x: f32, y: f32) -> f32 {
-    let inside = |d: f32| (0.5 - d).clamp(0.0, 1.0);
-    // Capsule body: center line x = 16, y 7..15, radius 5.
-    let cy = y.clamp(7.0, 15.0);
-    let body = ((x - 16.0).powi(2) + (y - cy).powi(2)).sqrt() - 5.0;
-    // Lower half ring around the body: center (16, 14), radius 9, 2 thick.
-    let ring = if y >= 14.0 {
-        (((x - 16.0).powi(2) + (y - 14.0).powi(2)).sqrt() - 9.0).abs() - 1.1
-    } else {
-        f32::MAX
-    };
-    // Stem and base.
-    let stem = ((x - 16.0).abs() - 1.1).max((y - 25.5).abs() - 2.5);
-    let base = ((x - 16.0).abs() - 5.5).max((y - 28.0).abs() - 1.1);
-    inside(body)
-        .max(inside(ring))
-        .max(inside(stem))
-        .max(inside(base))
 }
 
 fn make_icon(size: usize, rgb: [u8; 3]) -> Result<HICON> {
@@ -110,18 +91,5 @@ fn make_icon(size: usize, rgb: [u8; 3]) -> Result<HICON> {
         let _ = DeleteObject(color.into());
         let _ = DeleteObject(mask.into());
         icon
-    }
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn shape_covers_body_and_leaves_corners_empty() {
-        assert_eq!(coverage(16.0, 10.0), 1.0);
-        assert_eq!(coverage(16.0, 28.0), 1.0);
-        assert_eq!(coverage(1.0, 1.0), 0.0);
-        assert_eq!(coverage(31.0, 31.0), 0.0);
     }
 }

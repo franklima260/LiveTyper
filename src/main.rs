@@ -16,6 +16,7 @@ mod hotkey;
 mod hotkey;
 #[cfg(windows)]
 mod icon;
+mod icon_shape;
 #[cfg(target_os = "linux")]
 mod linux;
 mod logging;
@@ -32,6 +33,8 @@ mod scratch_pad;
 mod settings;
 #[cfg(windows)]
 mod terminals;
+#[cfg_attr(windows, allow(dead_code))]
+mod trace;
 #[cfg(windows)]
 mod tray;
 

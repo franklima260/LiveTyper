@@ -76,6 +76,8 @@ impl AudioBuffer {
 enum Command {
     Start(Arc<AudioBuffer>),
     Stop,
+    /// While paused, the microphone stays closed and a Dictation cannot start.
+    Pause(bool),
 }
 
 /// How long the microphone stays open.
@@ -117,6 +119,10 @@ struct Shared {
     inner: Mutex<Inner>,
     /// Set by the stream's error callback: the stream must open again.
     broken: AtomicBool,
+    /// For the tray icon: the microphone stream is open.
+    open: AtomicBool,
+    /// For the tray icon: the last try to open the microphone failed.
+    failing: AtomicBool,
 }
 
 #[derive(Default)]
@@ -229,6 +235,7 @@ fn rms_db(samples: &[f32]) -> f32 {
 /// Handle to the capture thread.
 pub struct Capture {
     commands: Sender<Command>,
+    shared: Arc<Shared>,
 }
 
 impl Capture {
@@ -240,11 +247,31 @@ impl Capture {
         on_error: impl Fn(String) + Send + 'static,
     ) -> Capture {
         let (commands, receiver) = mpsc::channel();
+        let shared = Arc::new(Shared::default());
+        let thread_shared = shared.clone();
         thread::Builder::new()
             .name("capture".into())
-            .spawn(move || run(&microphone, keep_open, &receiver, &on_error))
+            .spawn(move || run(&microphone, keep_open, thread_shared, &receiver, &on_error))
             .expect("spawn capture thread");
-        Capture { commands }
+        Capture { commands, shared }
+    }
+
+    /// Closes the microphone and refuses new Dictations until `pause(false)`.
+    #[cfg_attr(windows, allow(dead_code))]
+    pub fn pause(&self, paused: bool) {
+        let _ = self.commands.send(Command::Pause(paused));
+    }
+
+    /// True while the microphone stream is open.
+    #[cfg_attr(windows, allow(dead_code))]
+    pub fn is_open(&self) -> bool {
+        self.shared.open.load(Ordering::SeqCst)
+    }
+
+    /// True if the last try to open the microphone failed.
+    #[cfg_attr(windows, allow(dead_code))]
+    pub fn is_failing(&self) -> bool {
+        self.shared.failing.load(Ordering::SeqCst)
     }
 
     pub fn start(&self, buffer: Arc<AudioBuffer>) {
@@ -265,11 +292,13 @@ const REOPEN_WAIT: Duration = Duration::from_secs(5);
 fn run(
     microphone: &str,
     keep_open: KeepOpen,
+    shared: Arc<Shared>,
     commands: &Receiver<Command>,
     on_error: &dyn Fn(String),
 ) {
     // For tests without speaking: a 16 kHz mono 16-bit WAV file plays in place of the microphone.
     if let Some(path) = std::env::var_os("LIVETYPER_TEST_AUDIO").map(PathBuf::from) {
+        shared.open.store(true, Ordering::SeqCst);
         while let Ok(command) = commands.recv() {
             if let Command::Start(buffer) = command {
                 if let Err(message) = play_test_audio(&path, &buffer, commands) {
@@ -281,7 +310,6 @@ fn run(
         }
         return;
     }
-    let shared = Arc::new(Shared::default());
     let open = || -> Result<Stream, String> {
         open_microphone(microphone, shared.clone()).map(|stream| Box::new(stream) as Stream)
     };
@@ -294,6 +322,7 @@ fn run(
         match received {
             Ok(Command::Start(buffer)) => mic.start(buffer, on_error),
             Ok(Command::Stop) => mic.stop(),
+            Ok(Command::Pause(paused)) => mic.pause(paused),
             Err(RecvTimeoutError::Timeout) => mic.tick(),
             Err(RecvTimeoutError::Disconnected) => return,
         }
@@ -323,6 +352,8 @@ struct Microphone<'a> {
     post_roll_until: Option<Instant>,
     /// When the Talk Key went up, for the log.
     released_at: Instant,
+    /// Dictation is paused: the microphone stays closed.
+    paused: bool,
 }
 
 impl<'a> Microphone<'a> {
@@ -344,6 +375,7 @@ impl<'a> Microphone<'a> {
             failing: false,
             post_roll_until: None,
             released_at: Instant::now(),
+            paused: false,
         };
         if keep_open == KeepOpen::Always {
             let _ = mic.ensure_open();
@@ -353,6 +385,9 @@ impl<'a> Microphone<'a> {
 
     /// True while the microphone must be open.
     fn wanted(&self) -> bool {
+        if self.paused {
+            return false;
+        }
         self.recording
             || match self.keep_open {
                 KeepOpen::Always => true,
@@ -380,6 +415,7 @@ impl<'a> Microphone<'a> {
                 self.stream = Some(stream);
                 self.failing = false;
                 self.retry_at = None;
+                self.publish();
                 Ok(())
             }
             Err(message) => {
@@ -388,6 +424,7 @@ impl<'a> Microphone<'a> {
                 }
                 self.failing = true;
                 self.retry_at = Some(Instant::now() + REOPEN_WAIT);
+                self.publish();
                 Err(message)
             }
         }
@@ -399,6 +436,38 @@ impl<'a> Microphone<'a> {
         }
         self.close_at = None;
         self.retry_at = None;
+        self.publish();
+    }
+
+    /// Tells the tray whether the microphone is open or failing.
+    fn publish(&self) {
+        self.shared
+            .open
+            .store(self.stream.is_some(), Ordering::SeqCst);
+        self.shared.failing.store(self.failing, Ordering::SeqCst);
+    }
+
+    /// Pausing ends a Dictation that records and closes the microphone. Resuming opens it again
+    /// if it must be open all the time.
+    fn pause(&mut self, paused: bool) {
+        if paused == self.paused {
+            return;
+        }
+        if paused {
+            if self.recording {
+                self.end_dictation();
+            }
+            self.failing = false;
+            self.close();
+            self.paused = true;
+            log::info!("dictation paused");
+        } else {
+            self.paused = false;
+            log::info!("dictation resumed");
+            if self.keep_open == KeepOpen::Always {
+                let _ = self.ensure_open();
+            }
+        }
     }
 
     /// When `tick` must run next, or `None` to wait only for commands.
@@ -442,6 +511,10 @@ impl<'a> Microphone<'a> {
     }
 
     fn start(&mut self, buffer: Arc<AudioBuffer>, on_error: &dyn Fn(String)) {
+        if self.paused {
+            buffer.close();
+            return;
+        }
         // A push during the post-roll ends it: the audio from now on belongs to the new Dictation.
         if self.post_roll_until.is_some() {
             self.end_dictation();
@@ -586,8 +659,10 @@ fn play_test_audio(
     let mut position = 0;
     loop {
         match commands.recv_timeout(Duration::from_millis(5)) {
-            Ok(Command::Stop) => return Ok(()),
-            Ok(Command::Start(_)) | Err(mpsc::RecvTimeoutError::Timeout) => {}
+            // Pausing ends the Dictation, as Stop does.
+            Ok(Command::Stop | Command::Pause(true)) => return Ok(()),
+            Ok(Command::Start(_) | Command::Pause(false))
+            | Err(mpsc::RecvTimeoutError::Timeout) => {}
             Err(mpsc::RecvTimeoutError::Disconnected) => return Ok(()),
         }
         let due = (start.elapsed().as_secs_f64() * SAMPLE_RATE as f64) as usize;
@@ -985,6 +1060,29 @@ mod tests {
         shared.push(&tone(100, 0.2), 0.5);
         assert_eq!(ms(next.len()), 100);
         assert_eq!(ms(last.len()), 500);
+    }
+
+    #[test]
+    fn pause_closes_the_microphone_and_refuses_dictations_until_resume() {
+        let fake = FakeMicrophone::new();
+        let open = fake.opener();
+        let shared = Shared::default();
+        let mut mic = Microphone::new(KeepOpen::Always, &shared, &open, CHECK);
+        assert!(shared.open.load(Ordering::SeqCst));
+        let recording = Arc::new(AudioBuffer::default());
+        mic.start(recording.clone(), &no_error);
+        mic.pause(true);
+        assert!(recording.is_closed(), "pausing ends the Dictation");
+        assert_eq!(fake.counts(), (1, 1));
+        assert!(!shared.open.load(Ordering::SeqCst));
+        assert!(mic.next_wake().is_none(), "nothing reopens it while paused");
+        let refused = Arc::new(AudioBuffer::default());
+        mic.start(refused.clone(), &no_error);
+        assert!(refused.is_closed());
+        assert_eq!(fake.counts(), (1, 1));
+        mic.pause(false);
+        assert_eq!(fake.counts(), (2, 1));
+        assert!(shared.open.load(Ordering::SeqCst));
     }
 
     #[test]

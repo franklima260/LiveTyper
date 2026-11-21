@@ -480,23 +480,13 @@ impl PasteSession {
         self.closed.get()
     }
 
+    /// Pastes `text` as it is; `follow_up_text` decides about a space before it.
     pub async fn paste(
         &self,
-        text: &str,
-        target: Option<u32>,
-        started: Instant,
-        last_paste: Option<(u32, Instant)>,
+        text: String,
         verify_focus: impl Future<Output = Result<(), String>>,
     ) -> Result<(), String> {
         let Session { bus, path } = &self.session;
-        let follow_up = target.zip(last_paste).is_some_and(|(target, (last, at))| {
-            target == last && started.saturating_duration_since(at) < Duration::from_secs(30)
-        });
-        let text = if follow_up && needs_space_before(text) {
-            format!(" {text}")
-        } else {
-            text.to_owned()
-        };
         let received = Rc::new(Cell::new(false));
         self.selection.replace(Selection {
             text,
@@ -547,6 +537,37 @@ impl PasteSession {
     }
 }
 
+/// A Dictation that starts this soon after the last paste into the same window is a follow-up.
+pub const FOLLOW_UP_WINDOW: Duration = Duration::from_secs(30);
+
+/// The text to paste, with a space before it if it follows the last paste into the same window,
+/// and the facts of that decision for the Text Trace.
+pub fn follow_up_text(
+    text: &str,
+    target: Option<u32>,
+    started: Instant,
+    last_paste: Option<(u32, Instant)>,
+) -> (String, crate::trace::FollowUp) {
+    let same_target = target
+        .zip(last_paste)
+        .is_some_and(|(target, (last, _))| target == last);
+    let since = last_paste.map(|(_, at)| started.saturating_duration_since(at));
+    let follow_up = same_target && since.is_some_and(|since| since < FOLLOW_UP_WINDOW);
+    let space_added = follow_up && needs_space_before(text);
+    let text = if space_added {
+        format!(" {text}")
+    } else {
+        text.to_owned()
+    };
+    let facts = crate::trace::FollowUp {
+        same_target,
+        seconds_since_last: since.map(|since| since.as_secs_f64()),
+        window_seconds: FOLLOW_UP_WINDOW.as_secs_f64(),
+        space_added,
+    };
+    (text, facts)
+}
+
 fn needs_space_before(text: &str) -> bool {
     text.chars()
         .next()
@@ -589,6 +610,31 @@ async fn write_selection(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn follow_up_space_only_for_the_same_window_soon_after() {
+        let at = Instant::now();
+        let started = at + Duration::from_secs(5);
+        let (text, facts) = follow_up_text("Next.", Some(7), started, Some((7, at)));
+        assert_eq!(text, " Next.");
+        assert!(facts.same_target && facts.space_added);
+        assert_eq!(facts.seconds_since_last, Some(5.0));
+        let (text, facts) = follow_up_text("Next.", Some(8), started, Some((7, at)));
+        assert_eq!(text, "Next.");
+        assert!(!facts.same_target && !facts.space_added);
+        let late = at + FOLLOW_UP_WINDOW + Duration::from_secs(1);
+        assert_eq!(
+            follow_up_text("Next.", Some(7), late, Some((7, at))).0,
+            "Next."
+        );
+        assert_eq!(
+            follow_up_text(", then", Some(7), started, Some((7, at))).0,
+            ", then"
+        );
+        let (text, facts) = follow_up_text("First", None, started, None);
+        assert_eq!(text, "First");
+        assert_eq!(facts.seconds_since_last, None);
+    }
 
     #[test]
     fn one_press_and_release_for_a_repeating_hold() {

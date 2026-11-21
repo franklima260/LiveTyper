@@ -5,3 +5,8 @@ Comment=Local speech-to-text dictation
 Exec=livetyper
 Terminal=false
 Categories=Utility;Accessibility;
+Actions=text-trace;
+
+[Desktop Action text-trace]
+Name=Text Trace
+Exec=livetyper --text-trace

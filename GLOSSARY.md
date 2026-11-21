@@ -36,6 +36,10 @@ _Avoid_: Restrike, second Dictation
 The text box that has the focus when the user releases the Talk Key, and that receives the final Draft.
 _Avoid_: Target field, input, focused window
 
+**Text Trace**:
+An optional record, in memory only, of how the last Dictations became the pasted text: the live words, each Recast, the paste and what the Target Text Box showed afterwards. It is for debugging, and the user exports only the parts they choose.
+_Avoid_: Debug log, transcript log, text log
+
 **Minimum Device**:
 The weakest PC on which the app must work in real time: an x86-64 laptop from 2020 or newer, with 4 CPU cores, 8 GB RAM and integrated graphics only.
 _Avoid_: Low-end PC, target hardware

@@ -1,6 +1,7 @@
 //! A small append-only file logger behind the `log` facade.
 //!
 //! The log holds errors, events and timings. It must never hold dictated text.
+//! Dictated text belongs only in the memory-only Text Trace (`trace.rs`, ADR 0010).
 
 use std::fs::{self, File, OpenOptions};
 use std::io::Write;

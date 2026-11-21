@@ -20,7 +20,8 @@ trap 'rm -rf -- "$stage"' EXIT
 install -Dm755 "$target_dir/release/livetyper" "$stage/usr/bin/livetyper"
 install -Dm755 scripts/download-models.sh "$stage/usr/bin/livetyper-download-models"
 install -d "$stage/usr/share/applications"
-sed 's|^Exec=livetyper$|Exec=/usr/bin/livetyper|' \
+sed -e 's|^Exec=livetyper$|Exec=/usr/bin/livetyper|' \
+    -e 's|^Exec=livetyper --text-trace$|Exec=/usr/bin/livetyper --text-trace|' \
     data/io.github.franklima260.LiveTyper.desktop \
     > "$stage/usr/share/applications/io.github.franklima260.LiveTyper.desktop"
 extension="$stage/usr/share/gnome-shell/extensions/livetyper@franklima260.github.io"

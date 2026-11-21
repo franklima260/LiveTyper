@@ -355,6 +355,16 @@ impl Draft {
         pause.or(forward.last()).copied().or(cuts.last()).copied()
     }
 
+    /// The fixed and checked words, for the Text Trace.
+    pub fn snapshot(&self) -> crate::trace::DraftSnapshot {
+        crate::trace::DraftSnapshot {
+            fixed: self.fixed.clone(),
+            fixed_until_ms: self.fixed_until_ms,
+            checked: self.checked.clone(),
+            checked_until_ms: self.checked_until_ms,
+        }
+    }
+
     pub fn view(&self) -> DraftView {
         let checked: Vec<&str> = self
             .fixed

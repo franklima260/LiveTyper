@@ -202,6 +202,8 @@ pub fn run(settings: Settings, startup_warning: Option<String>) -> Result<()> {
             recast_window_ms: i64::from(settings.recast_window_s) * 1000,
             live_threads: settings.live_threads,
             recast_threads: settings.recast_threads,
+            // The Text Trace has no Windows window yet, so nothing would consume it.
+            text_trace: false,
         },
         |event| post(UiEvent::Engine(event)),
     );

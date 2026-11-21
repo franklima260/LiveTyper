@@ -82,11 +82,83 @@ The tray icon shows the state:
 
 The tray menu has these items: Paste Last Dictation, Open settings, Open log, Quit.
 
+On Linux, the tray icon shows what LiveTyper is doing. Its tooltip says why.
+
+- **Microphone and keyboard** (`assets/tray-icon.png`): ready, so the Talk Key starts a Dictation. It is red while you record and amber while LiveTyper finishes.
+- **Microphone with a slash** (`assets/tray-icon-muted.png`): LiveTyper cannot take a Dictation right now. That is when:
+  - dictation is paused;
+  - the microphone is closed, which is normal with `microphone_open = "after_use"` or `"dictation"` between Dictations;
+  - the microphone cannot open, or the models are missing.
+
+The menu has Text Trace…, Pause dictation (Resume dictation while paused), Open settings, Open log and Quit. Pausing stops a Dictation that records, closes the microphone, and makes the Talk Key do nothing until you resume. A Dictation that is already finishing still pastes.
+
+KDE Plasma shows the icon directly. GNOME shows it only with the AppIndicator extension, which Ubuntu turns on by default.
+
 ### Privacy
 
 - With the default `microphone_open = "always"`, the microphone is open all the time while LiveTyper runs, and Windows shows the microphone icon. The audio stays in memory only: LiveTyper keeps the last 3 s, and decodes nothing before you push the Talk Key. Set `microphone_open` to `"after_use"` or `"dictation"` to change this ([ADR 0009](docs/adr/0009-open-microphone-with-pre-roll.md)).
 - The log never contains dictated text.
+- The optional [Text Trace](#text-trace-debugging-spacing-and-formatting) is off by default. When you turn it on, it keeps the last Dictations in memory only, and nothing reaches the disk unless you export it.
 - The paste puts the Draft on the clipboard for a moment, and then puts back what was on the clipboard before. Windows clipboard history does not keep the Draft.
+
+## Text Trace: debugging spacing and formatting
+
+If LiveTyper puts in double spaces, stray periods or capitals, or other odd formatting, the Text Trace records how each Dictation became the pasted text, so that the cause can be found. It is available on Linux. Windows support is not ready yet.
+
+The trace contains what you dictated, so it is built to be safe ([ADR 0010](docs/adr/0010-text-trace-memory-only-opt-in-export.md)):
+
+- **Off by default.** Nothing is recorded until you turn it on.
+- **Memory only.** LiveTyper keeps the last 10 Dictations (`text_trace_keep`) in memory and never writes them to disk. Quitting LiveTyper, or **Clear all**, deletes all of them. There is no trace file to forget about.
+- **You choose what leaves.** Only **Export selected** writes anything to disk, and only the Dictations and parts you tick. A preview shows exactly what will be written.
+- **Words hidden by default.** In the export, letters show as `a`/`A`, digits as `0`, and spaces as `·`. For example, "Send it.  At 9:30" exports as `Aaaa·aa.··Aa·0:00`. The double space is still visible, but your words are not.
+- **Nothing is sent for you.** LiveTyper makes no network connections. You decide whether to attach the export to a GitHub issue.
+
+### What the trace records
+
+For each Dictation:
+
+- **Paste details and read-back:**
+  - the final text and how it was chosen;
+  - the paste method;
+  - whether a space was put before the text because it followed your last Dictation, and why;
+  - the exact text sent;
+  - what the text box showed afterwards.
+
+  The read-back takes the pasted text, plus at most 20 characters before it and 2 after the cursor. Those surrounding characters are text you did not dictate, so they are always hidden, even when you export real words. Some apps (many terminals, some browsers and Electron apps) do not expose their text, and then the trace says "read-back unavailable". LiveTyper never changes your accessibility settings to read more.
+- **Recast steps:** the live words as they appeared, each Recast's words and timings, and which words the Draft kept.
+- **Audio:** the recording of the Dictation, exported only if you tick **Audio**.
+
+### Use it safely, step by step
+
+1. **Turn it on.** In `~/.config/livetyper/settings.toml`, set:
+
+   ```toml
+   text_trace = true
+   ```
+
+   Restart LiveTyper. The log notes "Text Trace is on".
+2. **Reproduce the problem.** Dictate as usual until the double space or odd formatting appears. Dictating something harmless while you test keeps the trace free of private content.
+3. **Open the Text Trace window.** Choose **Text Trace…** in the LiveTyper tray menu, right-click the LiveTyper icon in the app grid or dock and choose **Text Trace**, or run:
+
+   ```sh
+   livetyper --text-trace
+   ```
+
+   Do this before you quit LiveTyper: quitting deletes the trace.
+4. **Choose what to share.**
+   - Tick only the Dictations that show the problem.
+   - Keep **Real words** and **Audio** off unless we ask for them. The hidden-words export is usually enough.
+   - Read the preview: it is exactly what will be written.
+5. **Export.** **Export selected** creates a folder named `livetyper-text-trace-<date>-<time>` in your Downloads folder, readable only by your user account. It contains `text-trace.txt`, plus `dictation-N.wav` files if you ticked Audio. Open `text-trace.txt` and check it once more before you share it.
+6. **Share it.** Attach `text-trace.txt` (and any WAV files) to a GitHub issue, together with what you expected and what happened. Remember that a GitHub issue is public.
+7. **Clean up.**
+   - Press **Clear all** in the Text Trace window, or quit LiveTyper, to delete the trace from memory.
+   - Delete the export folder when you no longer need it. LiveTyper does not track or delete exported files. Once you have attached them to an issue, they are in GitHub's hands.
+   - Set `text_trace = false` and restart LiveTyper when you are done debugging.
+
+**Limits:**
+- While the trace is on, recent Dictations are in LiveTyper's memory. Under memory pressure, the system can swap memory to disk, as it can for any app.
+- A crash loses the trace, so export soon after the problem appears.
 
 ## Install on a PC
 
@@ -241,6 +313,8 @@ A key that is not in the file takes its default value. An unknown key or an inco
 | `live_threads` | `0` | CPU threads for the live model. `0` = automatic. |
 | `recast_threads` | `0` | CPU threads for the Recast model. Automatic on GNOME uses one thread on systems with up to four logical CPUs. A positive value overrides this. Other desktops use the engine’s automatic sizing. |
 | `start_with_windows` | `true` | Start LiveTyper when you sign in to Windows. |
+| `text_trace` | `false` | Linux only. Keep a memory-only [Text Trace](#text-trace-debugging-spacing-and-formatting) of the last Dictations for debugging spacing and formatting. Nothing is written to disk unless you export it. |
+| `text_trace_keep` | `10` | How many Dictations the Text Trace keeps in memory. `1` to `50`. |
 | `startup_method` | `"registry"` | How LiveTyper starts with Windows: `"registry"` (a `LiveTyper` value under `HKCU\Software\Microsoft\Windows\CurrentVersion\Run`) or `"startup_folder"` (a `LiveTyper.lnk` shortcut in the Startup folder). LiveTyper keeps the selected way and removes the other one. |
 
 ## Files
@@ -338,6 +412,7 @@ cargo run --release --example spike -- --right 6 --live-threads 1 --recast-threa
 - [ADR 0007: A Recast checks only settled audio](docs/adr/0007-recast-checks-only-settled-audio.md)
 - [ADR 0008: The Talk Key through a low-level keyboard hook](docs/adr/0008-talk-key-through-a-keyboard-hook.md)
 - [ADR 0009: The microphone stays open, with a pre-roll and a post-roll](docs/adr/0009-open-microphone-with-pre-roll.md)
+- [ADR 0010: The Text Trace stays in memory, and the user exports only what they choose](docs/adr/0010-text-trace-memory-only-opt-in-export.md)
 
 The words of the project are in [GLOSSARY.md](GLOSSARY.md).
 

@@ -1,7 +1,10 @@
 //! Linux desktop integration for the shared dictation engine.
 
+mod a11y;
 mod pad;
 mod portal;
+mod trace_window;
+mod tray;
 
 use std::cell::{Cell, RefCell};
 use std::io::Write;
@@ -20,6 +23,9 @@ use crate::draft::DraftView;
 use crate::engine::{Engine, EngineConfig, EngineEvent};
 use crate::hotkey::{Hotkeys, KeyEvent};
 use crate::settings::{MicrophoneOpen, Settings};
+use crate::trace::{EngineTrace, PasteTrace, ReadBack, TraceStore};
+
+use trace_window::SharedStore;
 
 use pad::{ScratchPad, Status};
 
@@ -29,6 +35,9 @@ const MODIFIER_WAIT: Duration = Duration::from_secs(3);
 const PORTAL_FOCUS_FALLBACK: Duration = Duration::from_millis(350);
 const PORTAL_FOCUS_TIMEOUT: Duration = Duration::from_secs(1);
 const PORTAL_FOCUS_POLL: Duration = Duration::from_millis(20);
+/// The Text Trace reads the Target Text Box back this long after a paste.
+const READ_BACK_DELAY: Duration = Duration::from_millis(300);
+const TEXT_TRACE_ACTION: &str = "text-trace";
 
 enum Message {
     Key(KeyEvent, Instant),
@@ -37,11 +46,69 @@ enum Message {
     OutputFailed(String),
     OutputDone,
     PortalOutputFailed { text: String, error: String },
+    TogglePause,
 }
 
 struct PendingOutput {
     text: String,
     until: Instant,
+}
+
+/// The Text Trace, when `text_trace` is on.
+#[derive(Clone)]
+struct Trace {
+    store: SharedStore,
+    focus: Rc<RefCell<Option<Rc<a11y::FocusTracker>>>>,
+}
+
+impl Trace {
+    fn record_paste(&self, id: Option<u64>, paste: PasteTrace) {
+        let Some(id) = id else { return };
+        if let Some(item) = self.store.borrow_mut().get_mut(id) {
+            item.paste = Some(paste);
+        }
+    }
+
+    fn has_paste(&self, id: Option<u64>) -> bool {
+        id.is_some_and(|id| {
+            self.store
+                .borrow()
+                .items()
+                .any(|item| item.id == id && item.paste.is_some())
+        })
+    }
+
+    fn sent_chars(&self, id: Option<u64>) -> Option<usize> {
+        let id = id?;
+        let store = self.store.borrow();
+        let item = store.items().find(|item| item.id == id)?;
+        item.paste.as_ref().map(|paste| paste.sent.chars().count())
+    }
+
+    fn set_paste_result(&self, id: Option<u64>, result: &str) {
+        let Some(id) = id else { return };
+        let mut store = self.store.borrow_mut();
+        if let Some(paste) = store.get_mut(id).and_then(|item| item.paste.as_mut()) {
+            paste.result = result.to_owned();
+        }
+    }
+
+    /// Reads the Target Text Box back shortly after a paste.
+    fn read_back(&self, id: Option<u64>, sent_chars: usize) {
+        let Some(id) = id else { return };
+        let trace = self.clone();
+        glib::spawn_future_local(async move {
+            glib::timeout_future(READ_BACK_DELAY).await;
+            let focus = trace.focus.borrow().clone();
+            let read = match focus {
+                Some(focus) => focus.read_back(sent_chars).await,
+                None => ReadBack::Unavailable("the accessibility bus is not connected".into()),
+            };
+            if let Some(item) = trace.store.borrow_mut().get_mut(id) {
+                item.read_back = Some(read);
+            }
+        });
+    }
 }
 
 struct App {
@@ -69,6 +136,16 @@ struct App {
     next_released_at: Option<Instant>,
     selection: Option<&'static str>,
     message_until: Option<Instant>,
+    trace: Option<Trace>,
+    /// The engine trace of the Dictation that finishes, until it is pasted.
+    engine_trace: Option<EngineTrace>,
+    /// The Text Trace entry of the text that is being pasted.
+    trace_id: Option<u64>,
+    tray: Option<tray::Tray>,
+    /// Dictation is paused from the tray menu: the Talk Key does nothing and the microphone is closed.
+    paused: bool,
+    /// Why the last Dictation could not run (no microphone, no models), until one works again.
+    problem: Option<String>,
 }
 
 enum Keyboard {
@@ -95,12 +172,36 @@ pub fn run(settings: Settings, warning: Option<String>) -> Result<(), String> {
     gtk4::init().map_err(|e| e.to_string())?;
     let layer_shell = gtk4_layer_shell::is_supported();
 
+    let open_trace = std::env::args().any(|arg| arg == "--text-trace");
     let application = gtk4::Application::builder().application_id(APP_ID).build();
+    // Memory only; it exists only while the setting is on (ADR 0010).
+    let trace_store: Option<SharedStore> = settings.text_trace.then(|| {
+        Rc::new(RefCell::new(TraceStore::new(
+            settings.text_trace_keep as usize,
+        )))
+    });
+    let action = gio::SimpleAction::new(TEXT_TRACE_ACTION, None);
+    {
+        let application = application.clone();
+        let store = trace_store.clone();
+        action.connect_activate(move |_, _| trace_window::open(&application, store.clone()));
+    }
+    application.add_action(&action);
     application
         .register(gio::Cancellable::NONE)
         .map_err(|e| e.to_string())?;
     if application.is_remote() {
+        if open_trace {
+            // Opens the window in the LiveTyper that already runs.
+            application.activate_action(TEXT_TRACE_ACTION, None);
+            if let Some(bus) = application.dbus_connection() {
+                let _ = bus.flush_sync(gio::Cancellable::NONE);
+            }
+        }
         return Ok(());
+    }
+    if trace_store.is_some() {
+        log::info!("Text Trace is on: the last Dictations are kept in memory only");
     }
 
     let (sender, receiver) = mpsc::channel();
@@ -154,6 +255,7 @@ pub fn run(settings: Settings, warning: Option<String>) -> Result<(), String> {
             recast_window_ms: i64::from(settings.recast_window_s) * 1000,
             live_threads: settings.live_threads,
             recast_threads,
+            text_trace: settings.text_trace,
         },
         move |event| {
             let _ = speech.send(Message::Engine(event));
@@ -191,7 +293,31 @@ pub fn run(settings: Settings, warning: Option<String>) -> Result<(), String> {
         next_released_at: None,
         selection: None,
         message_until: None,
+        trace: trace_store.map(|store| Trace {
+            store,
+            focus: Rc::default(),
+        }),
+        engine_trace: None,
+        trace_id: None,
+        tray: None,
+        paused: false,
+        problem: None,
     };
+    if let (Some(trace), Some(bus)) = (&app.trace, &app.session_bus) {
+        let focus = trace.focus.clone();
+        let bus = bus.clone();
+        glib::spawn_future_local(async move {
+            match a11y::FocusTracker::new(&bus).await {
+                Ok(tracker) => {
+                    focus.replace(Some(Rc::new(tracker)));
+                }
+                Err(error) => log::warn!("Text Trace read-back unavailable: {error}"),
+            }
+        });
+    }
+    if open_trace {
+        application.activate_action(TEXT_TRACE_ACTION, None);
+    }
     if let Some(message) = warning {
         app.show_message(&message);
     }
@@ -199,6 +325,24 @@ pub fn run(settings: Settings, warning: Option<String>) -> Result<(), String> {
     let main_loop = glib::MainLoop::new(None, false);
     let quit = main_loop.clone();
     app.borrow().pad.connect_close(move || quit.quit());
+    let tray_bus = app.borrow().session_bus.clone();
+    if let Some(bus) = tray_bus {
+        let quit = main_loop.clone();
+        let application = application.clone();
+        let sender = app.borrow().sender.clone();
+        match tray::Tray::new(&bus, move |command| match command {
+            tray::MenuCommand::TextTrace => application.activate_action(TEXT_TRACE_ACTION, None),
+            tray::MenuCommand::TogglePause => {
+                let _ = sender.send(Message::TogglePause);
+            }
+            tray::MenuCommand::OpenSettings => open_file(&crate::paths::settings_file()),
+            tray::MenuCommand::OpenLog => open_file(&crate::paths::log_file()),
+            tray::MenuCommand::Quit => quit.quit(),
+        }) {
+            Ok(tray) => app.borrow_mut().tray = Some(tray),
+            Err(error) => log::warn!("{error}"),
+        }
+    }
     let tick = app.clone();
     let source = glib::timeout_add_local(FRAME, move || {
         let mut app = tick.borrow_mut();
@@ -230,6 +374,10 @@ impl App {
 
     fn receive(&mut self, message: Message) {
         match message {
+            Message::Key(KeyEvent::TalkDown, _) if self.paused => {
+                self.show_message("Dictation is paused. Resume it from the tray menu.");
+            }
+            Message::Key(KeyEvent::TalkUp, _) if self.paused => {}
             Message::Key(KeyEvent::TalkDown, at) => {
                 self.key_down_at = at;
                 self.step(Event::TalkKeyDown);
@@ -252,6 +400,7 @@ impl App {
                     return;
                 }
                 self.models_ready = true;
+                self.problem = None;
                 match self.dictation.state() {
                     State::Recording => self.pad.status(Status::Listening),
                     State::Finishing if self.deadline.is_none() => {
@@ -272,6 +421,7 @@ impl App {
                 if self.expire_deadline() {
                     return;
                 }
+                self.problem = None;
                 self.view = view;
                 if self.dictation.next() == Next::None {
                     self.pad.draft(&self.view);
@@ -280,11 +430,13 @@ impl App {
             Message::Engine(EngineEvent::Final {
                 generation,
                 text,
-                stats,
+                mut stats,
             }) if generation == self.generation && self.dictation.state() == State::Finishing => {
                 if self.expire_deadline() {
                     return;
                 }
+                self.engine_trace = stats.trace.take().map(|trace| *trace);
+                self.problem = None;
                 self.selection = Some(stats.final_selection.as_str());
                 log::info!(
                     "dictation: audio {:.1} s, {} words, model load {:?} ms, first text {:?} ms, {} recasts, last recast {:?} ms, preview cancellation {:?} ms",
@@ -316,8 +468,17 @@ impl App {
                     self.fail(&message);
                 }
             }
+            Message::TogglePause => self.toggle_pause(),
             Message::OutputFailed(text) => self.copy_output(&text),
-            Message::OutputDone => self.step(Event::PasteDone),
+            Message::OutputDone => {
+                if let Some(trace) = &self.trace {
+                    trace.set_paste_result(self.trace_id, "ok");
+                    if let Some(sent) = trace.sent_chars(self.trace_id) {
+                        trace.read_back(self.trace_id, sent);
+                    }
+                }
+                self.step(Event::PasteDone);
+            }
             Message::PortalOutputFailed { text, error } => {
                 log::warn!("Portal could not insert the dictation: {error}");
                 self.step(Event::PasteDone);
@@ -334,6 +495,69 @@ impl App {
     }
 
     fn step(&mut self, event: Event) {
+        self.handle_action(event);
+    }
+
+    /// Shows the tray icon for the current state, with the reason in its tooltip.
+    fn update_tray(&self) {
+        let Some(tray) = &self.tray else { return };
+        let state = self.dictation.state();
+        let recording = state == State::Recording || self.dictation.next() == Next::Recording;
+        let (icon, tip) = if self.paused {
+            (
+                tray::IconState::Muted,
+                "Paused. Choose Resume dictation in this menu.".to_owned(),
+            )
+        } else if recording {
+            (tray::IconState::Recording, "Recording".to_owned())
+        } else if matches!(state, State::Finishing | State::Pasting) {
+            (tray::IconState::Busy, "Finishing".to_owned())
+        } else if let Some(problem) = &self.problem {
+            (tray::IconState::Muted, format!("Cannot dictate: {problem}"))
+        } else if self.capture.is_failing() {
+            (
+                tray::IconState::Muted,
+                "The microphone cannot open".to_owned(),
+            )
+        } else if !self.capture.is_open() {
+            (
+                tray::IconState::Muted,
+                format!(
+                    "Microphone closed. It opens when you hold {}.",
+                    self.settings.talk_key
+                ),
+            )
+        } else {
+            (
+                tray::IconState::Ready,
+                format!("Hold {} to dictate", self.settings.talk_key),
+            )
+        };
+        tray.set_state(icon, &tip);
+    }
+
+    /// Pausing cancels a Dictation that records (one that finishes still pastes) and closes the
+    /// microphone. Resuming opens it again if it must be open all the time.
+    fn toggle_pause(&mut self) {
+        self.paused = !self.paused;
+        if self.paused
+            && (self.dictation.state() == State::Recording
+                || self.dictation.next() == Next::Recording)
+        {
+            self.step(Event::Escape);
+        }
+        self.capture.pause(self.paused);
+        if let Some(tray) = &self.tray {
+            tray.set_paused(self.paused);
+        }
+        self.show_message(if self.paused {
+            "Dictation paused. Resume it from the tray menu."
+        } else {
+            "Dictation resumed."
+        });
+    }
+
+    fn handle_action(&mut self, event: Event) {
         match self.dictation.handle(event) {
             Action::None => {}
             Action::Start => {
@@ -365,6 +589,23 @@ impl App {
                     self.released_at.elapsed().as_millis()
                 );
                 let text = insertion_text(self.final_text.take(), &self.view);
+                self.trace_id = self.trace.as_ref().map(|trace| {
+                    let time = glib::DateTime::now_local()
+                        .and_then(|now| now.format("%H:%M:%S"))
+                        .map(|time| time.to_string())
+                        .unwrap_or_default();
+                    let mut engine = self.engine_trace.take().unwrap_or_else(|| EngineTrace {
+                        selection,
+                        final_text: text.clone(),
+                        ..EngineTrace::default()
+                    });
+                    if engine.selection != selection {
+                        // The release deadline won over the engine's own pick.
+                        engine.selection = selection;
+                        engine.final_text.clone_from(&text);
+                    }
+                    trace.store.borrow_mut().push(time, Some(engine))
+                });
                 if text.is_empty() {
                     if self.dictation.next() == Next::None {
                         self.set_escape(false);
@@ -426,6 +667,7 @@ impl App {
         self.view = DraftView::default();
         self.final_text = None;
         self.selection = None;
+        self.engine_trace = None;
         if recorded {
             self.released_at = self.next_released_at.take().unwrap_or_else(Instant::now);
             self.engine.stop(self.generation);
@@ -468,6 +710,7 @@ impl App {
 
     fn fail(&mut self, message: &str) {
         log::error!("{message}");
+        self.problem = Some(message.trim_end_matches('.').to_owned());
         self.step(Event::Failed);
         if self.dictation.state() == State::Idle {
             self.show_message(message);
@@ -484,6 +727,26 @@ impl App {
             .session_bus
             .as_ref()
             .is_some_and(|bus| copy_to_plasma_clipboard(bus, text));
+        if let Some(trace) = &self.trace {
+            let result = if copied {
+                "not typed; copied to the Klipper clipboard for the user to paste"
+            } else {
+                "not typed, and could not copy"
+            };
+            if trace.has_paste(self.trace_id) {
+                trace.set_paste_result(self.trace_id, result);
+            } else {
+                trace.record_paste(
+                    self.trace_id,
+                    PasteTrace {
+                        method: "Klipper clipboard copy".into(),
+                        follow_up: None,
+                        sent: text.to_owned(),
+                        result: result.into(),
+                    },
+                );
+            }
+        }
         self.step(Event::PasteDone);
         if self.dictation.state() == State::Idle {
             if copied {
@@ -501,6 +764,8 @@ impl App {
     }
 
     fn paste_with_portal(&self, text: String) {
+        let trace = self.trace.clone();
+        let trace_id = self.trace_id;
         let bus = self
             .session_bus
             .clone()
@@ -551,8 +816,21 @@ impl App {
                     glib::timeout_future(PORTAL_FOCUS_FALLBACK).await;
                     None
                 };
+                let (sent, follow_up) =
+                    portal::follow_up_text(&text, target, started, last_paste.get());
+                if let Some(trace) = &trace {
+                    trace.record_paste(
+                        trace_id,
+                        PasteTrace {
+                            method: "Remote Desktop portal Ctrl+V".into(),
+                            follow_up: Some(follow_up),
+                            sent: sent.clone(),
+                            result: "pending".into(),
+                        },
+                    );
+                }
                 session
-                    .paste(&text, target, started, last_paste.get(), async {
+                    .paste(sent, async {
                         if let (Some(shell), Some(target)) = (&shell, target)
                             && pad::paste_target(shell).await != Some((target, false))
                         {
@@ -570,7 +848,23 @@ impl App {
                     log::info!("Dictation sent through the Remote Desktop paste portal");
                     Message::OutputDone
                 }
-                Err(error) => Message::PortalOutputFailed { text, error },
+                Err(error) => {
+                    if let Some(trace) = &trace {
+                        if !trace.has_paste(trace_id) {
+                            trace.record_paste(
+                                trace_id,
+                                PasteTrace {
+                                    method: "Remote Desktop portal Ctrl+V".into(),
+                                    follow_up: None,
+                                    sent: text.clone(),
+                                    result: String::new(),
+                                },
+                            );
+                        }
+                        trace.set_paste_result(trace_id, &format!("failed: {error}"));
+                    }
+                    Message::PortalOutputFailed { text, error }
+                }
             };
             let _ = sender.send(message);
         });
@@ -590,6 +884,7 @@ impl App {
 
     fn tick(&mut self) {
         self.expire_deadline();
+        self.update_tray();
         let now = Instant::now();
         if self.message_until.is_some_and(|deadline| now >= deadline) {
             self.message_until = None;
@@ -610,6 +905,17 @@ impl App {
                 .bytes()
                 .all(|c| c.is_ascii_graphic() || c == b' ')
             {
+                if let Some(trace) = &self.trace {
+                    trace.record_paste(
+                        self.trace_id,
+                        PasteTrace {
+                            method: "ydotool type".into(),
+                            follow_up: None,
+                            sent: pending.text.clone(),
+                            result: "pending".into(),
+                        },
+                    );
+                }
                 let sender = self.sender.clone();
                 let bus = self.session_bus.clone();
                 thread::spawn(move || {
@@ -674,6 +980,14 @@ fn uses_us_layout(bus: &gio::DBusConnection) -> Option<bool> {
 fn is_plain_us_layout((short_name, _, long_name): &(String, String, String)) -> bool {
     // KWin returns the layout code, the user display name, and the translated XKB name.
     short_name == "us" && long_name == "English (US)"
+}
+
+/// Opens a file in its default app.
+fn open_file(path: &std::path::Path) {
+    let uri = gio::File::for_path(path).uri();
+    if let Err(error) = gio::AppInfo::launch_default_for_uri(&uri, None::<&gio::AppLaunchContext>) {
+        log::error!("cannot open {}: {error}", path.display());
+    }
 }
 
 fn type_text(text: &str, bus: Option<&gio::DBusConnection>) -> std::io::Result<()> {

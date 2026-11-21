@@ -17,6 +17,7 @@ use transcribe_cpp::{
 
 use crate::audio::{AudioBuffer, SAMPLE_RATE};
 use crate::draft::{Draft, DraftView, TimedWord, has_words};
+use crate::trace::{EngineTrace, Step};
 
 pub const LIVE_MODEL: &str = "nemotron-speech-streaming-en-0.6b-Q8_0.gguf";
 pub const RECAST_MODEL: &str = "parakeet-tdt-0.6b-v3-Q8_0.gguf";
@@ -40,6 +41,8 @@ pub struct EngineConfig {
     pub recast_window_ms: i64,
     pub live_threads: u32,
     pub recast_threads: u32,
+    /// Record each step for the memory-only Text Trace.
+    pub text_trace: bool,
 }
 
 /// Timings of one Dictation, for the log.
@@ -59,6 +62,9 @@ pub struct Stats {
     /// Time from requesting preview cancellation until the final worker starts.
     pub preview_cancel_ms: Option<u128>,
     pub final_selection: FinalSelection,
+    /// The Text Trace of this Dictation, only when `text_trace` is on. It holds dictated text and
+    /// must never go into the log.
+    pub trace: Option<Box<EngineTrace>>,
 }
 
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
@@ -219,6 +225,7 @@ struct RecastResult {
     id: u64,
     preview_cancel_ms: Option<u128>,
     boundary_ms: i64,
+    start_ms: i64,
     end_ms: i64,
     last: bool,
     /// `None` if the decode failed. This is not the same as silence.
@@ -357,6 +364,7 @@ fn recast_worker(mut session: Session, jobs: &Receiver<RecastJob>, results: &Sen
             id: job.id,
             preview_cancel_ms,
             boundary_ms: job.boundary_ms,
+            start_ms: job.start_ms,
             end_ms: job.end_ms,
             last: job.last,
             words,
@@ -417,6 +425,7 @@ fn run(config: &EngineConfig, commands: &Receiver<Command>, emit: &dyn Fn(Engine
                     last_view: DraftView::default(),
                     stats: Stats {
                         load_ms,
+                        trace: config.text_trace.then(|| Box::new(EngineTrace::default())),
                         ..Default::default()
                     },
                     started: Instant::now(),
@@ -526,13 +535,24 @@ impl Dictation<'_> {
                         fallback_preview_id = None;
                         // The final job already has its planned cut. A successful preview that
                         // finished despite cancellation can still improve the deadline draft.
-                        if let Some(words) = result.words
-                            && let Some(before_preview) = self.draft.apply_fallback_preview(
+                        let words = result.words.clone();
+                        let applied = words.clone().and_then(|words| {
+                            self.draft.apply_fallback_preview(
                                 result.boundary_ms,
                                 result.end_ms,
                                 words,
                             )
-                        {
+                        });
+                        self.trace_recast(
+                            &result,
+                            words,
+                            if applied.is_some() {
+                                "fallback preview applied"
+                            } else {
+                                "fallback preview not used"
+                            },
+                        );
+                        if let Some(before_preview) = applied {
                             final_draft = Some(before_preview);
                             self.stats.recasts += 1;
                             self.stats.recast_total_ms += result.took_ms;
@@ -577,7 +597,11 @@ impl Dictation<'_> {
                     match s.feed(&chunk) {
                         Ok(update) if update.committed_changed || update.tentative_changed => {
                             let at_ms = ms(end) - self.config.lookahead_ms as i64;
-                            self.draft.set_live_text(&s.text().display(), at_ms.max(0));
+                            let text = s.text().display();
+                            self.draft.set_live_text(&text, at_ms.max(0));
+                            if let Some(trace) = self.stats.trace.as_mut() {
+                                trace.live(at_ms.max(0), &text);
+                            }
                             if self.stats.first_text_ms.is_none() {
                                 self.stats.first_text_ms = Some(self.started.elapsed().as_millis());
                                 self.stats.first_text_audio_ms = Some(ms(end));
@@ -600,7 +624,11 @@ impl Dictation<'_> {
                 if let Some(mut s) = stream.take() {
                     match s.finalize() {
                         Ok(_) => {
-                            self.draft.set_live_text(&s.text().display(), ms(fed));
+                            let text = s.text().display();
+                            self.draft.set_live_text(&text, ms(fed));
+                            if let Some(trace) = self.stats.trace.as_mut() {
+                                trace.live(ms(fed), &text);
+                            }
                             self.publish();
                         }
                         Err(e) => log::error!("live stream finalize: {e}"),
@@ -634,13 +662,23 @@ impl Dictation<'_> {
             (String::new(), FinalSelection::Empty)
         };
         self.stats.audio_ms = ms(self.audio.len());
-        self.stats.speech_onset_ms = speech_onset_ms(&self.audio.copy_range(0, self.audio.len()));
+        let samples = self.audio.copy_range(0, self.audio.len());
+        self.stats.speech_onset_ms = speech_onset_ms(&samples);
         self.stats.final_words = text.split_whitespace().count();
         self.stats.final_selection = selection;
+        if let Some(trace) = self.stats.trace.as_mut() {
+            trace.selection = selection.as_str();
+            trace.final_text.clone_from(&text);
+            trace.audio = Some(crate::trace::to_i16(&samples));
+        }
+        let trace = self.stats.trace.take();
         (self.emit)(EngineEvent::Final {
             generation: self.generation,
             text,
-            stats: self.stats.clone(),
+            stats: Stats {
+                trace,
+                ..self.stats.clone()
+            },
         });
     }
 
@@ -716,13 +754,48 @@ impl Dictation<'_> {
         Some(ActiveRecast { id, cancel })
     }
 
-    fn apply_preview(&mut self, result: RecastResult) {
+    fn apply_preview(&mut self, mut result: RecastResult) {
         self.stats.recasts += 1;
         self.stats.recast_total_ms += result.took_ms;
-        if let Some(words) = result.words {
-            self.draft
-                .apply_recast(result.boundary_ms, result.end_ms, words);
+        let traced = self.stats.trace.is_some().then(|| result.words.clone());
+        let applied = match result.words.take() {
+            Some(words) => self
+                .draft
+                .apply_recast(result.boundary_ms, result.end_ms, words),
+            None => false,
+        };
+        if let Some(words) = traced {
+            let outcome = if applied {
+                "applied"
+            } else {
+                "ignored (old boundary or failed)"
+            };
+            self.trace_recast(&result, words, outcome);
+        }
+        if applied {
             self.publish();
+        }
+    }
+
+    /// Records one Recast and the Draft after it in the Text Trace.
+    fn trace_recast(
+        &mut self,
+        result: &RecastResult,
+        words: Option<Vec<TimedWord>>,
+        outcome: &'static str,
+    ) {
+        let after = self.draft.snapshot();
+        if let Some(trace) = self.stats.trace.as_mut() {
+            trace.steps.push(Step::Recast {
+                last: result.last,
+                boundary_ms: result.boundary_ms,
+                start_ms: result.start_ms,
+                end_ms: result.end_ms,
+                took_ms: result.took_ms,
+                words,
+                outcome,
+                after,
+            });
         }
     }
 
@@ -731,21 +804,34 @@ impl Dictation<'_> {
         self.stats.recast_total_ms += result.took_ms;
         self.stats.final_recast_ms = Some(result.took_ms);
         self.stats.preview_cancel_ms = result.preview_cancel_ms;
-        let Some(words) = result.words else {
-            self.stats.final_selection = FinalSelection::DraftDecodeFailed;
-            return false;
+        let traced = self.stats.trace.is_some().then(|| result.words.clone());
+        let accepted = match result.words.clone() {
+            None => {
+                self.stats.final_selection = FinalSelection::DraftDecodeFailed;
+                false
+            }
+            Some(words) => {
+                let accepted = self.draft.accept_final_recast(
+                    result.boundary_ms,
+                    result.end_ms,
+                    self.config.recast_window_ms,
+                    words,
+                );
+                if !accepted {
+                    self.stats.final_selection = FinalSelection::DraftUnusable;
+                }
+                accepted
+            }
         };
-        if self.draft.accept_final_recast(
-            result.boundary_ms,
-            result.end_ms,
-            self.config.recast_window_ms,
-            words,
-        ) {
-            true
-        } else {
-            self.stats.final_selection = FinalSelection::DraftUnusable;
-            false
+        if let Some(words) = traced {
+            let outcome = match (&words, accepted) {
+                (None, _) => "decode failed",
+                (Some(_), true) => "accepted as final text",
+                (Some(_), false) => "not usable; the Draft is used instead",
+            };
+            self.trace_recast(&result, words, outcome);
         }
+        accepted
     }
 
     fn publish(&mut self) {
@@ -805,6 +891,7 @@ mod tests {
             id: 1,
             preview_cancel_ms: None,
             boundary_ms: 0,
+            start_ms: 0,
             end_ms: 1000,
             last: false,
             words: None,
@@ -859,6 +946,7 @@ mod tests {
             recast_window_ms: 15_000,
             live_threads: 2,
             recast_threads: 6,
+            text_trace: false,
         };
         assert_eq!(thread_counts(&config), (2, 6));
         let auto = EngineConfig {

@@ -31,6 +31,10 @@ pub struct Settings {
     pub recast_threads: u32,
     pub start_with_windows: bool,
     pub startup_method: StartupMethod,
+    /// Keep a memory-only Text Trace of the last Dictations for debugging (ADR 0010).
+    pub text_trace: bool,
+    /// How many Dictations the Text Trace keeps in memory.
+    pub text_trace_keep: u32,
 }
 
 impl Default for Settings {
@@ -58,6 +62,8 @@ impl Default for Settings {
             recast_threads: 0,
             start_with_windows: true,
             startup_method: StartupMethod::Registry,
+            text_trace: false,
+            text_trace_keep: 10,
         }
     }
 }
@@ -155,6 +161,13 @@ start_with_windows = true
 # How: "registry" (a Run value in the registry) or "startup_folder" (a shortcut in the Startup
 # folder). If one way does not work on a PC, try the other.
 startup_method = "registry"
+
+# Text Trace, for debugging spacing and formatting. Off by default. When on, LiveTyper keeps a
+# record of the last text_trace_keep Dictations in memory only, never on disk. Nothing leaves this
+# PC unless you export chosen Dictations yourself. Quitting LiveTyper deletes all of it.
+# See "Text Trace" in the README before you turn it on.
+text_trace = false
+text_trace_keep = 10
 "#;
 
 pub fn parse(text: &str) -> Result<Settings, String> {
@@ -175,6 +188,12 @@ pub fn parse(text: &str) -> Result<Settings, String> {
     }
     if settings.recast_window_s < 2 {
         return Err("recast_window_s: must be 2 or more".into());
+    }
+    if !(1..=crate::trace::MAX_KEEP as u32).contains(&settings.text_trace_keep) {
+        return Err(format!(
+            "text_trace_keep: must be 1 to {}",
+            crate::trace::MAX_KEEP
+        ));
     }
     Ok(settings)
 }

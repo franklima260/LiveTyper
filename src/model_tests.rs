@@ -43,6 +43,8 @@ fn config(models_dir: PathBuf) -> EngineConfig {
         recast_window_ms: i64::from(settings.recast_window_s) * 1000,
         live_threads: settings.live_threads,
         recast_threads: settings.recast_threads,
+        // Exercise the Text Trace hooks; they must not change the decode.
+        text_trace: true,
     }
 }
 
@@ -451,6 +453,10 @@ fn silence_gives_empty_text() {
         dictate(&rig, 1, &vec![0.0; 2 * SAMPLE_RATE], Feed::AllAtOnce).expect("a Final event");
     report("silence", &heard, 0.0);
     assert_eq!(heard.text, "");
+    // The Text Trace is on in these tests: it carries the audio and the final pick.
+    let trace = heard.stats.trace.as_ref().expect("a Text Trace");
+    assert_eq!(trace.selection, "empty");
+    assert_eq!(trace.audio.as_ref().map(Vec::len), Some(2 * SAMPLE_RATE));
 }
 
 /// This test does not need the models, so it is not ignored.
